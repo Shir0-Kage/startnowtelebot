@@ -1,0 +1,19 @@
+# secrets / local config
+.env
+
+# database
+*.db
+*.db-wal
+*.db-shm
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store

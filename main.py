@@ -1,0 +1,94 @@
+"""StartNOW! 2026 Telegram bot — entry point.
+
+Run with:  python main.py
+Make sure BOT_TOKEN is set first (see the README).
+"""
+
+import logging
+import sys
+
+from telegram import BotCommand
+from telegram.ext import Application
+
+import config
+import storage
+from handlers import (
+    announcements,
+    attendance,
+    common,
+    quests,
+    reminders,
+    schedule,
+    settings,
+)
+
+logging.basicConfig(
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+# httpx is noisy at INFO — quiet it down a notch
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+log = logging.getLogger("startnow")
+
+
+# Commands shown in Telegram's "/" menu. Facil-only ones are left out to keep
+# the menu tidy for students.
+MENU_COMMANDS = [
+    BotCommand("start", "What this bot does"),
+    BotCommand("help", "List all commands"),
+    BotCommand("quests", "Quest locations"),
+    BotCommand("quest", "Details for one quest"),
+    BotCommand("schedule", "Full StartNOW! schedule"),
+    BotCommand("next", "Next upcoming event"),
+    BotCommand("meetups", "The official meet-ups"),
+    BotCommand("engagements", "Optional sessions"),
+    BotCommand("slot", "Is this group AM or PM?"),
+    BotCommand("attendance", "Collect attendance"),
+    BotCommand("attendance_summary", "See who's present"),
+]
+
+
+async def _on_startup(app):
+    """Runs once after the app is built: set the menu and queue reminders."""
+    await app.bot.set_my_commands(MENU_COMMANDS)
+    reminders.schedule_reminders(app)
+    log.info("bot is up and running")
+
+
+async def _on_error(update, context):
+    log.exception("error while handling update", exc_info=context.error)
+
+
+def main():
+    if not config.BOT_TOKEN:
+        sys.exit(
+            "BOT_TOKEN is not set. Put it in a .env file or export it as an "
+            "environment variable — see the README."
+        )
+
+    storage.init_db()
+
+    app = (
+        Application.builder()
+        .token(config.BOT_TOKEN)
+        .post_init(_on_startup)
+        .build()
+    )
+
+    # wire up each feature
+    common.register(app)
+    quests.register(app)
+    schedule.register(app)
+    settings.register(app)
+    attendance.register(app)
+    announcements.register(app)
+
+    app.add_error_handler(_on_error)
+
+    # long-polling — simplest way to run; no public URL needed
+    app.run_polling(allowed_updates=None)
+
+
+if __name__ == "__main__":
+    main()

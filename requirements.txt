@@ -1,0 +1,3 @@
+# job-queue extra pulls in APScheduler, which we need for reminders
+python-telegram-bot[job-queue]>=21.4,<23
+python-dotenv>=1.0
