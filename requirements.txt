@@ -1,3 +1,5 @@
 # job-queue extra pulls in APScheduler, which we need for reminders
 python-telegram-bot[job-queue]>=21.4,<23
 python-dotenv>=1.0
+# guarantees the Asia/Singapore timezone is available on slim/container images
+tzdata>=2024.1
