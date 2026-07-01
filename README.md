@@ -150,13 +150,14 @@ people send it.
 
 ## Updating the schedule
 
-All the event data lives in [`data/events.py`](data/events.py). The meet-up AM
-and PM timings there are **placeholders** — search for `placeholder` and swap in
-the real times, then restart the bot:
+All the event data lives in [`data/events.py`](data/events.py). Meet-up slots
+start at 1000 SGT (AM) and 1900 SGT (PM), and each meet-up runs roughly
+1.5–2 hours. To change a timing, edit the relevant `am_time` / `pm_time` and
+restart the bot:
 
 ```python
-"am_time": time(10, 0),   # placeholder
-"pm_time": time(15, 0),   # placeholder
+"am_time": time(10, 0),   # AM slot — 1000 SGT
+"pm_time": time(19, 0),   # PM slot — 1900 SGT
 ```
 
 Quest text lives in [`data/quests.py`](data/quests.py).

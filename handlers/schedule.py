@@ -58,8 +58,8 @@ async def schedule_command(update, context):
     parts.append("\n".join(_platform_line(ev) for ev in events.PLATFORM))
 
     parts.append(
-        "\n<i>Meet-up timings shown are placeholders — check with your facil "
-        "for the confirmed times.</i>"
+        "\n<i>Meet-ups run about 1.5–2 hours. AM slots start 1000H SGT, "
+        "PM slots start 1900H SGT.</i>"
     )
 
     await update.effective_message.reply_html("\n".join(parts))

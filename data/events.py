@@ -7,8 +7,9 @@ Three kinds of entries:
   - "platform": Gather Town open/close markers (shown in the schedule, no
     attendance or reminders).
 
-Meet-up slot timings are placeholders — update am_time / pm_time below once the
-real timings are confirmed. Everything is Singapore time.
+Meet-up slots start at 1000 SGT (AM) and 1900 SGT (PM). Each meet-up runs
+roughly 1.5-2 hours, but the exact length varies per meet-up. Everything is
+Singapore time.
 """
 
 from datetime import date, datetime, time
@@ -85,8 +86,8 @@ MEETUPS = [
         "short": "Meet Up 1",
         "name": "Meet Up 1 — Icebreaker Games",
         "date": date(2026, 7, 12),
-        "am_time": time(10, 0),   # placeholder
-        "pm_time": time(15, 0),   # placeholder
+        "am_time": time(10, 0),   # AM slot — 1000 SGT
+        "pm_time": time(19, 0),   # PM slot — 1900 SGT
         "where": "Gather Town",
         "what": "Icebreaker games with your orientation group",
     },
@@ -96,8 +97,8 @@ MEETUPS = [
         "short": "Meet Up 2",
         "name": "Meet Up 2 — Cross-Group Bonding Games",
         "date": date(2026, 7, 18),
-        "am_time": time(10, 0),   # placeholder
-        "pm_time": time(15, 0),   # placeholder
+        "am_time": time(10, 0),   # AM slot — 1000 SGT
+        "pm_time": time(19, 0),   # PM slot — 1900 SGT
         "where": "Gather Town",
         "what": "Bonding games across different orientation groups",
     },
@@ -107,8 +108,8 @@ MEETUPS = [
         "short": "Meet Up 3",
         "name": "Meet Up 3 — Finale Event",
         "date": date(2026, 7, 25),
-        "am_time": time(10, 0),   # placeholder
-        "pm_time": time(15, 0),   # placeholder
+        "am_time": time(10, 0),   # AM slot — 1000 SGT
+        "pm_time": time(19, 0),   # PM slot — 1900 SGT
         "where": "Gather Town",
         "what": "The big finale to wrap up StartNOW!",
     },
