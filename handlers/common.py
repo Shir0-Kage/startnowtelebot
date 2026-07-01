@@ -43,6 +43,11 @@ async def start(update, context):
     chat = update.effective_chat
     if chat:
         storage.ensure_group(chat.id, chat.title or chat.full_name or "")
+    # note who's checked in — the group setup scripts use this to know who's
+    # ready to be added to the orientation groups
+    user = update.effective_user
+    if user:
+        storage.mark_started(user.id, user.username, user.full_name)
     await update.effective_message.reply_html(START_TEXT)
 
 

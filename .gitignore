@@ -6,6 +6,11 @@
 *.db-wal
 *.db-shm
 
+# telethon login session (grants full account access) + setup output
+*.session
+*.session-journal
+setup/created_groups.json
+
 # python
 __pycache__/
 *.py[cod]

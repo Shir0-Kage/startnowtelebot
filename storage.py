@@ -39,6 +39,13 @@ CREATE TABLE IF NOT EXISTS attendance_state (
     is_open   INTEGER DEFAULT 1,
     PRIMARY KEY (chat_id, event_key)
 );
+
+CREATE TABLE IF NOT EXISTS started_users (
+    user_id      INTEGER PRIMARY KEY,
+    username     TEXT,          -- lowercased, no @
+    display_name TEXT,
+    marked_at    TEXT
+);
 """
 
 
@@ -218,4 +225,27 @@ def all_attendance(chat_id):
             "SELECT * FROM attendance WHERE chat_id = ? ORDER BY event_key, marked_at",
             (chat_id,),
         ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Who has messaged the bot /start (used by the group-provisioning scripts)
+# ---------------------------------------------------------------------------
+
+def mark_started(user_id, username, display_name):
+    with _lock:
+        _conn.execute(
+            """INSERT INTO started_users (user_id, username, display_name, marked_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   username = excluded.username,
+                   display_name = excluded.display_name""",
+            (user_id, (username or "").lower(), display_name, _now_iso()),
+        )
+        _conn.commit()
+
+
+def get_started():
+    with _lock:
+        rows = _conn.execute("SELECT * FROM started_users").fetchall()
     return [dict(r) for r in rows]

@@ -218,6 +218,51 @@ machine reboots or the process dies.
 
 ---
 
+## Provisioning the 20 orientation groups (one-time)
+
+Telegram **bots can't create groups or add members**, so the initial setup is
+done by a **user account** (the StartNOW! Director's) using the scripts in
+`setup/`. This runs once; the bot then takes over day-to-day.
+
+**One-time prep:**
+
+1. Log in to [my.telegram.org](https://my.telegram.org) as the owner account →
+   *API development tools* → create an app → copy `api_id` and `api_hash`.
+2. Add to `.env`:
+   ```
+   TELEGRAM_API_ID=...
+   TELEGRAM_API_HASH=...
+   TELEGRAM_PHONE=+65XXXXXXXX
+   ```
+3. `pip install -r requirements.txt` (pulls in Telethon).
+
+**Phase 1 — create the groups (run once):**
+
+```bash
+python -m setup.create_groups --dry-run   # preview: lists the 20 groups
+python -m setup.create_groups             # for real
+```
+
+The first real run asks for the login code Telegram sends the owner (and 2FA
+password if set), then creates all 20 groups, adds the bot, and records each
+group's AM/PM slot. Progress is saved to `setup/created_groups.json`, so it's
+safe to re-run if interrupted.
+
+**Phase 2 — add the team as they check in:**
+
+Each teammate sends `/start` to the bot. Then:
+
+```bash
+python -m setup.add_members            # add everyone who's checked in
+python -m setup.add_members --watch     # or leave running; adds people as they /start
+```
+
+Members are promoted to admin with their role title. If someone's privacy
+settings block a direct add, the script prints an invite link to send them.
+
+> The Telethon `*.session` file grants full access to the owner's account — it's
+> gitignored, keep it private.
+
 ## Where data is stored
 
 Everything persists in a single SQLite file (`bot.db` by default):
