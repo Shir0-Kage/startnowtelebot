@@ -86,8 +86,8 @@ async def _cycle(client):
 
         for title in groups:
             entry = data[title]
-            channel = await client.get_entity(entry["chat_id"])
             try:
+                channel = await client.get_entity(entry["chat_id"])
                 try:
                     await client(InviteToChannelRequest(channel, [user]))
                 except UserAlreadyParticipantError:
@@ -104,6 +104,10 @@ async def _cycle(client):
                 print(f"hit a flood wait ({e.seconds}s) — progress saved, pausing")
                 manifest.save(data)
                 await asyncio.sleep(e.seconds + 5)
+            except Exception as exc:
+                # one bad group shouldn't abort the run (esp. under --watch).
+                # members_added is only written on success, so it retries later.
+                print(f"  couldn't add @{uname} to {title} ({exc}); will retry")
             await asyncio.sleep(THROTTLE)
     return added
 
@@ -126,9 +130,15 @@ async def run(dry_run, watch):
     try:
         if watch:
             print("watching for /start check-ins — Ctrl-c to stop")
-            while True:
-                await _cycle(client)
-                await asyncio.sleep(WATCH_INTERVAL)
+            try:
+                while True:
+                    try:
+                        await _cycle(client)
+                    except Exception as exc:
+                        print(f"cycle error ({exc}); will retry next tick")
+                    await asyncio.sleep(WATCH_INTERVAL)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                print("stopped watching.")
         else:
             n = await _cycle(client)
             print(f"done — {n} add(s) this run." if n else "nobody new to add.")
