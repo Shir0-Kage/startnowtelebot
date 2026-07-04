@@ -22,7 +22,7 @@ from telethon.tl.types import ChatAdminRights
 
 import storage
 from setup import manifest, roster
-from setup.client import PHONE, build_client
+from setup.client import start_client
 
 # seconds to wait between creating groups, to stay under Telegram's spam radar
 THROTTLE = 4
@@ -113,8 +113,7 @@ async def run(dry_run):
         return
 
     storage.init_db()  # make sure the shared tables exist
-    client = build_client()
-    await client.start(**({"phone": PHONE} if PHONE else {}))
+    client = await start_client()
     try:
         for g in roster.GROUPS:
             try:

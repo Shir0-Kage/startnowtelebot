@@ -70,9 +70,12 @@ CREATE TABLE IF NOT EXISTS year_one_added (
 
 def init_db():
     global _conn
-    _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # timeout lets a write wait for the lock instead of erroring — bot.db is
+    # shared by the bot and the setup worker (separate processes).
+    _conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     _conn.row_factory = sqlite3.Row
     _conn.execute("PRAGMA journal_mode=WAL")
+    _conn.execute("PRAGMA busy_timeout=30000")
     with _lock:
         _conn.executescript(SCHEMA)
         _conn.commit()

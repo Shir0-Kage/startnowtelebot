@@ -22,7 +22,7 @@ from telethon.tl.functions.messages import ExportChatInviteRequest
 
 import storage
 from setup import sheets
-from setup.client import PHONE, build_client
+from setup.client import start_client
 
 THROTTLE = 3
 WATCH_INTERVAL = 20
@@ -130,8 +130,7 @@ async def run(dry_run, watch):
         print("dry run — nothing changed.")
         return
 
-    client = build_client()
-    await client.start(**({"phone": PHONE} if PHONE else {}))
+    client = await start_client()
     try:
         if watch:
             print("watching for /add_year_ones requests — Ctrl-c to stop")

@@ -253,9 +253,11 @@ safe to re-run if interrupted.
 Each teammate sends `/start` to the bot. Then:
 
 ```bash
-python -m setup.add_members            # add everyone who's checked in
-python -m setup.add_members --watch     # or leave running; adds people as they /start
+python -m setup.add_members            # add everyone who's checked in right now
 ```
+
+To leave it running so people are added as they `/start`, use the combined
+worker (see "Running the worker" below) rather than `--watch` on its own.
 
 Members are promoted to admin with their role title. If someone's privacy
 settings block a direct add, the script prints an invite link to send them.
@@ -300,7 +302,21 @@ Because the bot can't add members, this is a two-part flow:
    (bad handle or locked-down privacy) gets a DM with the group's invite link;
    anyone the DM can't reach is printed for the facil to follow up.
 
-Run this worker alongside `add_members` (e.g. another tmux window).
+### Running the worker — use ONE process
+
+Only one Telethon script can use the login session at a time (a second one
+gets "database is locked"). So for continuous operation, **don't** run
+`add_members --watch` and `add_year_ones --watch` separately — run the single
+combined worker, which does both:
+
+```bash
+python -m setup.worker
+```
+
+The one-off scripts (`create_groups`, `add_facils`, `set_group_photo`) still
+work, but **stop the worker first** before running one. If you forget, the
+script exits with a clear "session in use" message instead of locking up. The
+worker is safe to run next to the bot (`main.py`) — they use different files.
 
 ### Group photo — `setup/set_group_photo.py`
 

@@ -25,7 +25,7 @@ from telethon.tl.types import ChatAdminRights
 
 import storage
 from setup import manifest, roster
-from setup.client import PHONE, build_client
+from setup.client import start_client
 
 THROTTLE = 3
 WATCH_INTERVAL = 30
@@ -125,8 +125,7 @@ async def run(dry_run, watch):
         print("dry run — nothing changed.")
         return
 
-    client = build_client()
-    await client.start(**({"phone": PHONE} if PHONE else {}))
+    client = await start_client()
     try:
         if watch:
             print("watching for /start check-ins — Ctrl-c to stop")

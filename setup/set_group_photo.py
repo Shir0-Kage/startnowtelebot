@@ -20,7 +20,7 @@ from telethon.tl.functions.channels import EditPhotoRequest
 from telethon.tl.types import InputChatUploadedPhoto
 
 from setup import manifest
-from setup.client import PHONE, build_client
+from setup.client import start_client
 
 THROTTLE = 2
 DEFAULT_IMAGE = os.path.join(os.path.dirname(__file__), "group_photo.png")
@@ -72,8 +72,7 @@ async def run(image_path, dry_run):
             "Put the photo there (or pass --image path/to/file), then re-run."
         )
 
-    client = build_client()
-    await client.start(**({"phone": PHONE} if PHONE else {}))
+    client = await start_client()
     try:
         done = await apply(client, targets, image_path)
     finally:

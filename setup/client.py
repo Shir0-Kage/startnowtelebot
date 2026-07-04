@@ -37,8 +37,35 @@ def build_client():
     return TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 
 
-async def connect(client):
-    """Connect + authenticate. Prompts for the code on first run."""
-    kwargs = {"phone": PHONE} if PHONE else {}
-    await client.start(**kwargs)
+# Two Telethon clients can't share one session file — the second gets
+# "database is locked". This holds an OS-level lock so only one setup script
+# uses the session at a time; the lock frees automatically if the process dies.
+_lock_handle = None
+
+
+def _acquire_session_lock():
+    global _lock_handle
+    try:
+        import fcntl  # Linux/macOS (the server); absent on Windows dev boxes
+    except ImportError:
+        return
+    _lock_handle = open(SESSION_NAME + ".lock", "w")
+    try:
+        fcntl.flock(_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(
+            "Another setup script is already using the Telegram session — only "
+            "one can at a time.\nStop it first, or run the combined worker "
+            "instead of separate --watch scripts:\n    python -m setup.worker"
+        )
+    _lock_handle.write(str(os.getpid()))
+    _lock_handle.flush()
+
+
+async def start_client():
+    """Grab the single-session lock, then build + connect the client.
+    Prompts for the login code on first run."""
+    _acquire_session_lock()
+    client = build_client()
+    await client.start(**({"phone": PHONE} if PHONE else {}))
     return client

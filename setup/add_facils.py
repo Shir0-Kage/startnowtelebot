@@ -21,7 +21,7 @@ from telethon.tl.functions.channels import EditAdminRequest, InviteToChannelRequ
 from telethon.tl.types import ChatAdminRights
 
 from setup import manifest, sheets
-from setup.client import PHONE, build_client
+from setup.client import start_client
 
 THROTTLE = 3
 REPORT_PATH = os.path.join(os.path.dirname(__file__), "facil_match_report.csv")
@@ -126,8 +126,7 @@ async def _commit(rows):
     matched = [r for r in rows if r["status"] == "matched"]
     print(f"{len(matched)} matched facil(s) to add.")
 
-    client = build_client()
-    await client.start(**({"phone": PHONE} if PHONE else {}))
+    client = await start_client()
     try:
         for r in matched:
             title = f"StartNOW! {r['group']}"
