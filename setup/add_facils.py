@@ -15,6 +15,7 @@ import asyncio
 import csv
 import json
 import os
+from itertools import groupby
 
 from telethon.errors import (
     FloodWaitError,
@@ -30,7 +31,8 @@ from setup import manifest, sheets
 from setup.client import start_client
 
 # adding users is heavily rate-limited; go slow to avoid tripping PeerFloodError
-THROTTLE = 10
+THROTTLE = 10           # seconds between adds within a group
+GROUP_DELAY = 60        # seconds to wait between groups
 REPORT_PATH = os.path.join(os.path.dirname(__file__), "facil_match_report.csv")
 ADDED_PATH = os.path.join(os.path.dirname(__file__), "facil_added.json")
 
@@ -127,53 +129,85 @@ def build_rows():
     return match_facils(facils, handles)
 
 
-async def _commit(rows):
+def _og_order(group):
+    return (0 if group[:2].upper() == "AM" else 1, int(group[2:]))
+
+
+async def _add_one(client, r, groups, added):
+    """Add + promote one facil. Returns a status string."""
+    title = f"StartNOW! {r['group']}"
+    entry = groups.get(title)
+    if not entry or not entry.get("chat_id"):
+        print(f"  no group created for {title} yet — skipping {r['name']}")
+        return "no_group"
+    chat_id = str(entry["chat_id"])
+    if r["handle"] in added.get(chat_id, []):
+        return "skipped"
+
+    # resolve the username first — a bad handle is a data issue, not flood
+    try:
+        user = await client.get_input_entity(r["handle"])
+    except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
+        print(f"  @{r['handle']} ({r['name']}) — no such username; fix the handle")
+        return "bad_handle"
+
+    try:
+        channel = await client.get_entity(entry["chat_id"])
+        try:
+            await client(InviteToChannelRequest(channel, [user]))
+        except UserAlreadyParticipantError:
+            pass
+        await client(EditAdminRequest(channel, user, FACIL_RIGHTS, rank="Facil"))
+        added.setdefault(chat_id, []).append(r["handle"])
+        _save_added(added)
+        print(f"  added @{r['handle']} to {title} as admin")
+        return "added"
+    except PeerFloodError:
+        return "flood"
+    except FloodWaitError as e:
+        print(f"  flood wait {e.seconds}s — pausing")
+        await asyncio.sleep(e.seconds + 5)
+        return "floodwait"
+    except Exception as exc:
+        print(f"  couldn't add {r['name']} (@{r['handle']}) to {title} ({exc})")
+        return "error"
+
+
+async def _commit(rows, group_delay, only):
     groups = manifest.load()  # title -> {chat_id, ...}
     added = _load_added()
     matched = [r for r in rows if r["status"] == "matched"]
-    print(f"{len(matched)} matched facil(s) to add.")
+    if only:
+        matched = [r for r in matched if r["group"].upper() == only.upper()]
+        if not matched:
+            print(f"no matched facils for {only}.")
+            return
+    matched.sort(key=lambda r: _og_order(r["group"]))
+    by_group = [(og, list(it)) for og, it in groupby(matched, key=lambda r: r["group"])]
+    print(f"{len(matched)} facil(s) across {len(by_group)} group(s); "
+          f"{group_delay}s between groups.")
 
     n_added, bad_handles, flooded = 0, [], False
     client = await start_client()
     try:
-        for r in matched:
-            title = f"StartNOW! {r['group']}"
-            entry = groups.get(title)
-            if not entry or not entry.get("chat_id"):
-                print(f"  no group created for {title} yet — skipping {r['name']}")
-                continue
-            chat_id = str(entry["chat_id"])
-            if r["handle"] in added.get(chat_id, []):
-                continue
-
-            # resolve the username first — a bad handle is a data issue, not flood
-            try:
-                user = await client.get_input_entity(r["handle"])
-            except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
-                print(f"  @{r['handle']} ({r['name']}) — no such username; fix the handle")
-                bad_handles.append(f"{r['name']} ({r['group']}) @{r['handle']}")
-                continue
-
-            try:
-                channel = await client.get_entity(entry["chat_id"])
-                try:
-                    await client(InviteToChannelRequest(channel, [user]))
-                except UserAlreadyParticipantError:
-                    pass
-                await client(EditAdminRequest(channel, user, FACIL_RIGHTS, rank="Facil"))
-                added.setdefault(chat_id, []).append(r["handle"])
-                _save_added(added)
-                n_added += 1
-                print(f"  added @{r['handle']} to {title} as admin")
-            except PeerFloodError:
-                flooded = True
-                break  # account is flagged — stop, don't make it worse
-            except FloodWaitError as e:
-                print(f"  flood wait {e.seconds}s — pausing")
-                await asyncio.sleep(e.seconds + 5)
-            except Exception as exc:
-                print(f"  couldn't add {r['name']} (@{r['handle']}) to {title} ({exc})")
-            await asyncio.sleep(THROTTLE)
+        for i, (og, facils) in enumerate(by_group):
+            print(f"\n-- {og} ({len(facils)} facil(s)) --")
+            for r in facils:
+                status = await _add_one(client, r, groups, added)
+                if status == "added":
+                    n_added += 1
+                elif status == "bad_handle":
+                    bad_handles.append(f"{r['name']} ({r['group']}) @{r['handle']}")
+                elif status == "flood":
+                    flooded = True
+                    break
+                if status not in ("skipped", "no_group"):
+                    await asyncio.sleep(THROTTLE)
+            if flooded:
+                break
+            if i < len(by_group) - 1:  # pause between groups, not after the last
+                print(f"   waiting {group_delay}s before the next group…")
+                await asyncio.sleep(group_delay)
     finally:
         await client.disconnect()
 
@@ -185,14 +219,13 @@ async def _commit(rows):
     if flooded:
         print(
             "\nSTOPPED: Telegram rate-limited adding (PeerFloodError).\n"
-            "   The account is temporarily flagged for adding too many people.\n"
-            "   Wait several hours (often ~24h) before running again, and DON'T\n"
-            "   keep retrying — repeated attempts extend the limit. For large\n"
-            "   batches, invite people via link instead of adding them directly."
+            "   Already-added facils are saved, so wait a few hours and re-run —\n"
+            "   it resumes where it left off. Or do one group at a time with\n"
+            "   --only AM1, spaced out over the day."
         )
 
 
-async def run(commit):
+async def run(commit, group_delay, only):
     rows = build_rows()
     write_report(rows)
     print(f"wrote {REPORT_PATH}")
@@ -203,14 +236,17 @@ async def run(commit):
               "'matched' facils. ('ambiguous' / 'no_handle' need a handle or a "
               "manual fix first.)")
         return
-    await _commit(rows)
+    await _commit(rows, group_delay, only)
 
 
 def main():
-    p = argparse.ArgumentParser(description="Add facils to their groups.")
+    p = argparse.ArgumentParser(description="Add facils to their groups, group by group.")
     p.add_argument("--commit", action="store_true", help="actually add the matched facils")
+    p.add_argument("--group-delay", type=int, default=GROUP_DELAY,
+                   help="seconds to wait between groups (default %(default)s)")
+    p.add_argument("--only", default=None, help="add just one group, e.g. --only AM1")
     args = p.parse_args()
-    asyncio.run(run(args.commit))
+    asyncio.run(run(args.commit, args.group_delay, args.only))
 
 
 if __name__ == "__main__":
