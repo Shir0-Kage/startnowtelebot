@@ -224,7 +224,7 @@ async def _dm_invite(client, r, groups):
         return "unreachable"
 
 
-async def _commit(rows, group_delay, only):
+async def _commit(rows, group_delay, only, client=None):
     groups = manifest.load()  # title -> {chat_id, ...}
     added = _load_added()
     matched = [r for r in rows if r["status"] == "matched"]
@@ -240,7 +240,9 @@ async def _commit(rows, group_delay, only):
 
     n_added, n_invited, bad, unreachable = 0, 0, set(), []
     consecutive, add_stopped = 0, False
-    client = await start_client()
+    own_client = client is None
+    if own_client:
+        client = await start_client()
     try:
         for i, (og, facils) in enumerate(by_group):
             print(f"\n-- {og} ({len(facils)} facil(s)) --")
@@ -277,7 +279,8 @@ async def _commit(rows, group_delay, only):
                 print(f"   waiting {group_delay}s before the next group…")
                 await asyncio.sleep(group_delay)
     finally:
-        await client.disconnect()
+        if own_client:
+            await client.disconnect()
 
     print(f"\nadded {n_added} directly; DM'd invite links to {n_invited}.")
     if bad:
@@ -293,7 +296,7 @@ async def _commit(rows, group_delay, only):
               "python -m setup.add_facils --promote")
 
 
-async def _promote(only):
+async def _promote(only, client=None):
     """Promote matched facils who are already IN their group (e.g. joined via an
     invite link) to admin. Promoting a member isn't rate-limited."""
     groups = manifest.load()
@@ -303,7 +306,9 @@ async def _promote(only):
     rows.sort(key=lambda r: _og_order(r["group"]))
 
     n = 0
-    client = await start_client()
+    own_client = client is None
+    if own_client:
+        client = await start_client()
     try:
         for og, facils in groupby(rows, key=lambda r: r["group"]):
             want = {r["handle"].lower(): r for r in facils if r["handle"]}
@@ -323,8 +328,20 @@ async def _promote(only):
                     print(f"  couldn't promote @{uname} ({exc})")
                 await asyncio.sleep(2)
     finally:
-        await client.disconnect()
+        if own_client:
+            await client.disconnect()
     print(f"\npromoted {n} facil(s) who have joined.")
+
+
+async def run_facils(client):
+    """Daily task (used by the worker): add facils, then promote whoever's
+    joined. Idempotent — skips anyone already added/promoted, so it's safe to
+    run every morning until everyone's in."""
+    rows = build_rows()
+    matched = sum(1 for r in rows if r["status"] == "matched")
+    print(f"facil task: {matched} matched facil(s)")
+    await _commit(rows, GROUP_DELAY, None, client=client)
+    await _promote(None, client=client)
 
 
 async def run(commit, promote, group_delay, only):
