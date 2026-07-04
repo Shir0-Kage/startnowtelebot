@@ -23,8 +23,10 @@ from telethon.errors import (
     UserAlreadyParticipantError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
+    UserPrivacyRestrictedError,
 )
 from telethon.tl.functions.channels import EditAdminRequest, InviteToChannelRequest
+from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.tl.types import ChatAdminRights
 
 from setup import manifest, sheets
@@ -36,6 +38,11 @@ GROUP_DELAY = 60        # seconds to wait between groups
 FLOOD_CAP = 3           # consecutive non-contact rejections before we stop adding
 REPORT_PATH = os.path.join(os.path.dirname(__file__), "facil_match_report.csv")
 ADDED_PATH = os.path.join(os.path.dirname(__file__), "facil_added.json")
+
+INVITE_MSG = (
+    "Hi {name}! 🌟 You're a StartNOW! 2026 facil for {og}. "
+    "Join your group here: {link}"
+)
 
 FACIL_RIGHTS = ChatAdminRights(
     change_info=True,
@@ -134,8 +141,25 @@ def _og_order(group):
     return (0 if group[:2].upper() == "AM" else 1, int(group[2:]))
 
 
-async def _add_one(client, r, groups, added):
-    """Add + promote one facil. Returns a status string."""
+def _mark_added(added, chat_id, handle):
+    added.setdefault(chat_id, []).append(handle)
+    _save_added(added)
+
+
+async def _get_link(client, groups, title):
+    """Group invite link — reuse the stored one, else make + remember it."""
+    entry = groups[title]
+    if entry.get("invite_link"):
+        return entry["invite_link"]
+    peer = await client.get_entity(entry["chat_id"])
+    link = (await client(ExportChatInviteRequest(peer))).link
+    entry["invite_link"] = link
+    manifest.save(groups)
+    return link
+
+
+async def _try_add(client, r, groups, added):
+    """Try to add + promote one facil directly. Returns a status string."""
     title = f"StartNOW! {r['group']}"
     entry = groups.get(title)
     if not entry or not entry.get("chat_id"):
@@ -155,17 +179,23 @@ async def _add_one(client, r, groups, added):
     try:
         channel = await client.get_entity(entry["chat_id"])
         try:
-            await client(InviteToChannelRequest(channel, [user]))
+            result = await client(InviteToChannelRequest(channel, [user]))
         except UserAlreadyParticipantError:
-            pass
+            _mark_added(added, chat_id, r["handle"])
+            return "added"
+        # newer Telegram reports privacy-blocked users here instead of raising
+        if getattr(result, "missing_invitees", None):
+            print(f"  @{r['handle']} ({r['name']}) — privacy blocks a direct add")
+            return "cant_add"
         await client(EditAdminRequest(channel, user, FACIL_RIGHTS, rank="Facil"))
-        added.setdefault(chat_id, []).append(r["handle"])
-        _save_added(added)
+        _mark_added(added, chat_id, r["handle"])
         print(f"  added @{r['handle']} to {title} as admin")
         return "added"
+    except UserPrivacyRestrictedError:
+        print(f"  @{r['handle']} ({r['name']}) — privacy blocks a direct add")
+        return "cant_add"
     except PeerFloodError:
-        # Telegram won't let a user account add non-contacts — not a rate limit.
-        return "needs_invite"
+        return "flood"
     except FloodWaitError as e:
         print(f"  flood wait {e.seconds}s — pausing")
         await asyncio.sleep(e.seconds + 5)
@@ -173,6 +203,25 @@ async def _add_one(client, r, groups, added):
     except Exception as exc:
         print(f"  couldn't add {r['name']} (@{r['handle']}) to {title} ({exc})")
         return "error"
+
+
+async def _dm_invite(client, r, groups):
+    """DM a facil their group's invite link. On Telegram Premium this reaches
+    non-contacts too. Returns 'invited' or 'unreachable'."""
+    title = f"StartNOW! {r['group']}"
+    entry = groups.get(title)
+    if not entry or not entry.get("chat_id"):
+        return "unreachable"
+    try:
+        link = await _get_link(client, groups, title)
+        await client.send_message(
+            r["handle"], INVITE_MSG.format(name=r["name"], og=r["group"], link=link)
+        )
+        print(f"  DM'd invite link to @{r['handle']} ({r['name']})")
+        return "invited"
+    except Exception as exc:
+        print(f"  couldn't DM @{r['handle']} ({exc})")
+        return "unreachable"
 
 
 async def _commit(rows, group_delay, only):
@@ -189,55 +238,59 @@ async def _commit(rows, group_delay, only):
     print(f"{len(matched)} facil(s) across {len(by_group)} group(s); "
           f"{group_delay}s between groups.")
 
-    n_added, bad = 0, set()
-    consecutive, stopped = 0, False
+    n_added, n_invited, bad, unreachable = 0, 0, set(), []
+    consecutive, add_stopped = 0, False
     client = await start_client()
     try:
         for i, (og, facils) in enumerate(by_group):
-            if stopped:
-                break
             print(f"\n-- {og} ({len(facils)} facil(s)) --")
             for r in facils:
-                status = await _add_one(client, r, groups, added)
+                if add_stopped:
+                    status = "cant_add"  # skip the add attempt, go straight to invite
+                else:
+                    status = await _try_add(client, r, groups, added)
+                    if status == "added":
+                        consecutive = 0
+                    elif status == "flood":
+                        consecutive += 1
+                        if consecutive >= FLOOD_CAP:
+                            add_stopped = True
+                            print("  repeated add-limit hits — sending invite links "
+                                  "only from here to protect the account.")
+
                 if status == "added":
                     n_added += 1
-                    consecutive = 0
-                elif status == "bad_handle":
-                    bad.add(r["handle"].lower())
-                elif status == "needs_invite":
-                    consecutive += 1
-                    print(f"  @{r['handle']} ({r['name']}) isn't a contact — "
-                          "can't add directly; they'll need an invite link")
-                    if consecutive >= FLOOD_CAP:
-                        print(f"\n  hit the non-contact limit {FLOOD_CAP}x in a row — "
-                              "stopping direct adds to protect the account.")
-                        stopped = True
-                        break
-                if status not in ("skipped", "no_group"):
                     await asyncio.sleep(THROTTLE)
-            if not stopped and i < len(by_group) - 1:
+                    continue
+                if status == "bad_handle":
+                    bad.add(r["handle"].lower())
+                    continue
+                if status in ("skipped", "no_group"):
+                    continue
+                # cant_add / flood / floodwait / error -> send an invite link instead
+                if await _dm_invite(client, r, groups) == "invited":
+                    n_invited += 1
+                else:
+                    unreachable.append(f"{r['name']} ({r['group']}) @{r['handle']}")
+                await asyncio.sleep(THROTTLE)
+            if not add_stopped and i < len(by_group) - 1:
                 print(f"   waiting {group_delay}s before the next group…")
                 await asyncio.sleep(group_delay)
     finally:
         await client.disconnect()
 
-    # anyone matched but not added (and whose handle resolves) needs an invite
-    added_handles = {h.lower() for hs in added.values() for h in hs}
-    needs = [r for r in matched
-             if r["handle"].lower() not in added_handles
-             and r["handle"].lower() not in bad]
-
-    print(f"\nadded {n_added} facil(s) directly (contacts).")
+    print(f"\nadded {n_added} directly; DM'd invite links to {n_invited}.")
     if bad:
-        print(f"{len(bad)} handle(s) don't resolve — fix these "
-              "(setup.find_handles can suggest the right ones).")
-    if needs:
-        print(f"\n{len(needs)} facil(s) aren't the owner's contacts, so Telegram "
-              "won't let you add them directly. Onboard them via invite link:")
-        for r in needs[:60]:
-            print(f"  - {r['name']} ({r['group']}) @{r['handle']}")
-        print("\n  1) python -m setup.invite_links   -> share each group's link\n"
-              "  2) once they've joined: python -m setup.add_facils --promote")
+        print(f"{len(bad)} handle(s) don't resolve — setup.find_handles can suggest fixes.")
+    if unreachable:
+        print(f"\n{len(unreachable)} couldn't be reached (add blocked AND DM failed):")
+        for u in unreachable[:60]:
+            print("  -", u)
+        print("  post their group's link in a shared group instead "
+              "(python -m setup.invite_links).")
+    if n_invited:
+        print("\nOnce the invited facils have joined: "
+              "python -m setup.add_facils --promote")
 
 
 async def _promote(only):

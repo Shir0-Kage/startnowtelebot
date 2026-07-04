@@ -287,14 +287,18 @@ grouping sheet, joined only by name.
 python -m setup.add_facils             # writes facil_match_report.csv, adds nobody
 # fix any 'ambiguous' / 'no_handle' rows (see find_handles below)
 
-python -m setup.add_facils --commit     # adds the ones who are contacts; lists the rest
-python -m setup.invite_links            # prints each group's invite link — share them
-# ...people tap their link and join...
-python -m setup.add_facils --promote    # makes the joined facils admins
+python -m setup.add_facils --commit     # add contacts; DM an invite link to the rest
+# ...invited people tap their link and join...
+python -m setup.add_facils --promote    # make the joined facils admins
 ```
 
-`--commit` never aborts on the non-contact limit — it adds who it can, then
-prints exactly who needs an invite link. Both `--commit` and `--promote` take
+`--commit` tries to add each facil directly; anyone Telegram won't let you add
+(non-contact) is instead **DM'd their group's invite link**. That DM only
+reaches non-contacts if the owner account has **Telegram Premium** — without it,
+those DMs fail and are listed for you to hand out the link another way
+(`python -m setup.invite_links` prints each group's link to post in a shared
+group). `--commit` never aborts on the limit, and switches to invite-only after
+repeated rejections to protect the account. Both `--commit` and `--promote` take
 `--only AM1` to work one group at a time.
 
 ### Year 1s — `/add_year_ones` + the worker
