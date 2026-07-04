@@ -14,6 +14,8 @@ setup/created_groups.json
 setup/facil_match_report.csv
 setup/facil_added.json
 setup/*_cache.csv
+# local image asset dropped in for set_group_photo.py
+setup/group_photo.*
 
 # python
 __pycache__/

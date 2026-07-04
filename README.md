@@ -302,6 +302,20 @@ Because the bot can't add members, this is a two-part flow:
 
 Run this worker alongside `add_members` (e.g. another tmux window).
 
+### Group photo — `setup/set_group_photo.py`
+
+Sets the same profile photo on every group (reads the group list from the
+manifest). Put the image on the machine first, then:
+
+```bash
+python -m setup.set_group_photo --dry-run     # list the groups, change nothing
+python -m setup.set_group_photo               # uses setup/group_photo.png
+python -m setup.set_group_photo --image path/to/logo.png
+```
+
+A roughly square image works best (Telegram crops it to a circle). The image
+file is gitignored — it's a local asset, not committed.
+
 ## Where data is stored
 
 Everything persists in a single SQLite file (`bot.db` by default):
