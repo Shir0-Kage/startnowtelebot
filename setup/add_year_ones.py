@@ -14,6 +14,7 @@ import asyncio
 
 from telethon.errors import (
     FloodWaitError,
+    PeerFloodError,
     UserAlreadyParticipantError,
     UserPrivacyRestrictedError,
 )
@@ -24,8 +25,9 @@ import storage
 from setup import sheets
 from setup.client import start_client
 
-THROTTLE = 3
+THROTTLE = 8            # adds are heavily rate-limited — go slow
 WATCH_INTERVAL = 20
+PEERFLOOD_BACKOFF = 3600  # if Telegram flags us for spam, back off an hour
 
 DM_TEMPLATE = (
     "Hi! 🌟 You've been placed in your StartNOW! 2026 orientation group ({og}).\n\n"
@@ -69,6 +71,8 @@ async def _process(client, req, roster):
                 continue
             except UserPrivacyRestrictedError:
                 pass  # fall through to the DM path
+            except PeerFloodError:
+                raise  # account flagged for spam — abort, let the caller back off
             except FloodWaitError as e:
                 print(f"  flood wait {e.seconds}s — pausing")
                 await asyncio.sleep(e.seconds + 5)
@@ -86,6 +90,8 @@ async def _process(client, req, roster):
             await client.send_message(target, DM_TEMPLATE.format(og=og, link=link))
             dmed += 1
             print(f"  DM'd invite to {name} ({target})")
+        except PeerFloodError:
+            raise  # spam-flagged — stop reaching out
         except Exception as exc:
             unreachable.append(f"{name} ({m['raw_handle'] or 'no handle'})")
             print(f"  couldn't reach {name} ({exc})")
@@ -104,6 +110,8 @@ async def _cycle(client):
     for req in reqs:
         try:
             await _process(client, req, roster)
+        except PeerFloodError:
+            raise  # bubble up so the loop backs off instead of hammering
         except Exception as exc:
             print(f"request {req['id']} ({req['og']}) failed ({exc}); will retry")
             continue
@@ -138,14 +146,22 @@ async def run(dry_run, watch):
                 while True:
                     try:
                         await _cycle(client)
+                    except PeerFloodError:
+                        print(f"PeerFloodError — Telegram is rate-limiting adds; "
+                              f"backing off {PEERFLOOD_BACKOFF // 60} min")
+                        await asyncio.sleep(PEERFLOOD_BACKOFF)
                     except Exception as exc:
                         print(f"cycle error ({exc}); will retry next tick")
                     await asyncio.sleep(WATCH_INTERVAL)
             except (KeyboardInterrupt, asyncio.CancelledError):
                 print("stopped watching.")
         else:
-            n = await _cycle(client)
-            print(f"processed {n} request(s)." if n else "nothing queued.")
+            try:
+                n = await _cycle(client)
+                print(f"processed {n} request(s)." if n else "nothing queued.")
+            except PeerFloodError:
+                print("STOP: PeerFloodError — Telegram flagged the account for adding "
+                      "too many people. Stop and wait several hours before retrying.")
     finally:
         await client.disconnect()
 

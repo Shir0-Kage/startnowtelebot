@@ -16,14 +16,21 @@ import csv
 import json
 import os
 
-from telethon.errors import FloodWaitError, UserAlreadyParticipantError
+from telethon.errors import (
+    FloodWaitError,
+    PeerFloodError,
+    UserAlreadyParticipantError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+)
 from telethon.tl.functions.channels import EditAdminRequest, InviteToChannelRequest
 from telethon.tl.types import ChatAdminRights
 
 from setup import manifest, sheets
 from setup.client import start_client
 
-THROTTLE = 3
+# adding users is heavily rate-limited; go slow to avoid tripping PeerFloodError
+THROTTLE = 10
 REPORT_PATH = os.path.join(os.path.dirname(__file__), "facil_match_report.csv")
 ADDED_PATH = os.path.join(os.path.dirname(__file__), "facil_added.json")
 
@@ -126,6 +133,7 @@ async def _commit(rows):
     matched = [r for r in rows if r["status"] == "matched"]
     print(f"{len(matched)} matched facil(s) to add.")
 
+    n_added, bad_handles, flooded = 0, [], False
     client = await start_client()
     try:
         for r in matched:
@@ -137,9 +145,17 @@ async def _commit(rows):
             chat_id = str(entry["chat_id"])
             if r["handle"] in added.get(chat_id, []):
                 continue
+
+            # resolve the username first — a bad handle is a data issue, not flood
+            try:
+                user = await client.get_input_entity(r["handle"])
+            except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
+                print(f"  @{r['handle']} ({r['name']}) — no such username; fix the handle")
+                bad_handles.append(f"{r['name']} ({r['group']}) @{r['handle']}")
+                continue
+
             try:
                 channel = await client.get_entity(entry["chat_id"])
-                user = await client.get_input_entity(r["handle"])
                 try:
                     await client(InviteToChannelRequest(channel, [user]))
                 except UserAlreadyParticipantError:
@@ -147,7 +163,11 @@ async def _commit(rows):
                 await client(EditAdminRequest(channel, user, FACIL_RIGHTS, rank="Facil"))
                 added.setdefault(chat_id, []).append(r["handle"])
                 _save_added(added)
+                n_added += 1
                 print(f"  added @{r['handle']} to {title} as admin")
+            except PeerFloodError:
+                flooded = True
+                break  # account is flagged — stop, don't make it worse
             except FloodWaitError as e:
                 print(f"  flood wait {e.seconds}s — pausing")
                 await asyncio.sleep(e.seconds + 5)
@@ -156,6 +176,20 @@ async def _commit(rows):
             await asyncio.sleep(THROTTLE)
     finally:
         await client.disconnect()
+
+    print(f"\nadded {n_added} facil(s).")
+    if bad_handles:
+        print(f"{len(bad_handles)} handle(s) don't resolve — fix these and re-run:")
+        for b in bad_handles:
+            print("  -", b)
+    if flooded:
+        print(
+            "\nSTOPPED: Telegram rate-limited adding (PeerFloodError).\n"
+            "   The account is temporarily flagged for adding too many people.\n"
+            "   Wait several hours (often ~24h) before running again, and DON'T\n"
+            "   keep retrying — repeated attempts extend the limit. For large\n"
+            "   batches, invite people via link instead of adding them directly."
+        )
 
 
 async def run(commit):

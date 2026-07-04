@@ -16,11 +16,14 @@ stop this worker first — only one Telethon script can use the session at a tim
 
 import asyncio
 
+from telethon.errors import PeerFloodError
+
 import storage
 from setup import add_members, add_year_ones
 from setup.client import start_client
 
 INTERVAL = 20
+PEERFLOOD_BACKOFF = 3600  # if Telegram flags us for spam, back off an hour
 
 # (label, one-pass coroutine) — reuses each feature's existing cycle
 JOBS = [
@@ -38,6 +41,10 @@ async def run():
             for label, cycle in JOBS:
                 try:
                     await cycle(client)
+                except PeerFloodError:
+                    print(f"{label}: PeerFloodError — Telegram is rate-limiting "
+                          f"adds; backing off {PEERFLOOD_BACKOFF // 60} min")
+                    await asyncio.sleep(PEERFLOOD_BACKOFF)
                 except Exception as exc:
                     print(f"{label} cycle error ({exc}); will retry next tick")
             await asyncio.sleep(INTERVAL)
