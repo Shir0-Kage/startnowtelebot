@@ -33,6 +33,7 @@ from setup.client import start_client
 # adding users is heavily rate-limited; go slow to avoid tripping PeerFloodError
 THROTTLE = 10           # seconds between adds within a group
 GROUP_DELAY = 60        # seconds to wait between groups
+FLOOD_CAP = 3           # consecutive non-contact rejections before we stop adding
 REPORT_PATH = os.path.join(os.path.dirname(__file__), "facil_match_report.csv")
 ADDED_PATH = os.path.join(os.path.dirname(__file__), "facil_added.json")
 
@@ -163,7 +164,8 @@ async def _add_one(client, r, groups, added):
         print(f"  added @{r['handle']} to {title} as admin")
         return "added"
     except PeerFloodError:
-        return "flood"
+        # Telegram won't let a user account add non-contacts — not a rate limit.
+        return "needs_invite"
     except FloodWaitError as e:
         print(f"  flood wait {e.seconds}s — pausing")
         await asyncio.sleep(e.seconds + 5)
@@ -187,45 +189,96 @@ async def _commit(rows, group_delay, only):
     print(f"{len(matched)} facil(s) across {len(by_group)} group(s); "
           f"{group_delay}s between groups.")
 
-    n_added, bad_handles, flooded = 0, [], False
+    n_added, bad = 0, set()
+    consecutive, stopped = 0, False
     client = await start_client()
     try:
         for i, (og, facils) in enumerate(by_group):
+            if stopped:
+                break
             print(f"\n-- {og} ({len(facils)} facil(s)) --")
             for r in facils:
                 status = await _add_one(client, r, groups, added)
                 if status == "added":
                     n_added += 1
+                    consecutive = 0
                 elif status == "bad_handle":
-                    bad_handles.append(f"{r['name']} ({r['group']}) @{r['handle']}")
-                elif status == "flood":
-                    flooded = True
-                    break
+                    bad.add(r["handle"].lower())
+                elif status == "needs_invite":
+                    consecutive += 1
+                    print(f"  @{r['handle']} ({r['name']}) isn't a contact — "
+                          "can't add directly; they'll need an invite link")
+                    if consecutive >= FLOOD_CAP:
+                        print(f"\n  hit the non-contact limit {FLOOD_CAP}x in a row — "
+                              "stopping direct adds to protect the account.")
+                        stopped = True
+                        break
                 if status not in ("skipped", "no_group"):
                     await asyncio.sleep(THROTTLE)
-            if flooded:
-                break
-            if i < len(by_group) - 1:  # pause between groups, not after the last
+            if not stopped and i < len(by_group) - 1:
                 print(f"   waiting {group_delay}s before the next group…")
                 await asyncio.sleep(group_delay)
     finally:
         await client.disconnect()
 
-    print(f"\nadded {n_added} facil(s).")
-    if bad_handles:
-        print(f"{len(bad_handles)} handle(s) don't resolve — fix these and re-run:")
-        for b in bad_handles:
-            print("  -", b)
-    if flooded:
-        print(
-            "\nSTOPPED: Telegram rate-limited adding (PeerFloodError).\n"
-            "   Already-added facils are saved, so wait a few hours and re-run —\n"
-            "   it resumes where it left off. Or do one group at a time with\n"
-            "   --only AM1, spaced out over the day."
-        )
+    # anyone matched but not added (and whose handle resolves) needs an invite
+    added_handles = {h.lower() for hs in added.values() for h in hs}
+    needs = [r for r in matched
+             if r["handle"].lower() not in added_handles
+             and r["handle"].lower() not in bad]
+
+    print(f"\nadded {n_added} facil(s) directly (contacts).")
+    if bad:
+        print(f"{len(bad)} handle(s) don't resolve — fix these "
+              "(setup.find_handles can suggest the right ones).")
+    if needs:
+        print(f"\n{len(needs)} facil(s) aren't the owner's contacts, so Telegram "
+              "won't let you add them directly. Onboard them via invite link:")
+        for r in needs[:60]:
+            print(f"  - {r['name']} ({r['group']}) @{r['handle']}")
+        print("\n  1) python -m setup.invite_links   -> share each group's link\n"
+              "  2) once they've joined: python -m setup.add_facils --promote")
 
 
-async def run(commit, group_delay, only):
+async def _promote(only):
+    """Promote matched facils who are already IN their group (e.g. joined via an
+    invite link) to admin. Promoting a member isn't rate-limited."""
+    groups = manifest.load()
+    rows = [r for r in build_rows() if r["status"] == "matched"]
+    if only:
+        rows = [r for r in rows if r["group"].upper() == only.upper()]
+    rows.sort(key=lambda r: _og_order(r["group"]))
+
+    n = 0
+    client = await start_client()
+    try:
+        for og, facils in groupby(rows, key=lambda r: r["group"]):
+            want = {r["handle"].lower(): r for r in facils if r["handle"]}
+            entry = groups.get(f"StartNOW! {og}")
+            if not entry or not entry.get("chat_id"):
+                continue
+            channel = await client.get_entity(entry["chat_id"])
+            async for u in client.iter_participants(channel):
+                uname = (u.username or "").lower()
+                if uname not in want:
+                    continue
+                try:
+                    await client(EditAdminRequest(channel, u, FACIL_RIGHTS, rank="Facil"))
+                    n += 1
+                    print(f"  promoted @{uname} in StartNOW! {og}")
+                except Exception as exc:
+                    print(f"  couldn't promote @{uname} ({exc})")
+                await asyncio.sleep(2)
+    finally:
+        await client.disconnect()
+    print(f"\npromoted {n} facil(s) who have joined.")
+
+
+async def run(commit, promote, group_delay, only):
+    if promote:
+        await _promote(only)
+        return
+
     rows = build_rows()
     write_report(rows)
     print(f"wrote {REPORT_PATH}")
@@ -241,12 +294,14 @@ async def run(commit, group_delay, only):
 
 def main():
     p = argparse.ArgumentParser(description="Add facils to their groups, group by group.")
-    p.add_argument("--commit", action="store_true", help="actually add the matched facils")
+    p.add_argument("--commit", action="store_true", help="add the matched facils (contacts)")
+    p.add_argument("--promote", action="store_true",
+                   help="promote matched facils who've already joined (e.g. via invite link)")
     p.add_argument("--group-delay", type=int, default=GROUP_DELAY,
                    help="seconds to wait between groups (default %(default)s)")
-    p.add_argument("--only", default=None, help="add just one group, e.g. --only AM1")
+    p.add_argument("--only", default=None, help="just one group, e.g. --only AM1")
     args = p.parse_args()
-    asyncio.run(run(args.commit, args.group_delay, args.only))
+    asyncio.run(run(args.commit, args.promote, args.group_delay, args.only))
 
 
 if __name__ == "__main__":

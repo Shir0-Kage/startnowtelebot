@@ -274,16 +274,28 @@ the generated report and caches are gitignored.
 ### Facils — `setup/add_facils.py`
 
 Handles live in the assessment workbook; AM/PM group assignments live in the
-grouping sheet, joined only by name. So it works in two steps:
+grouping sheet, joined only by name.
+
+> **Important — Telegram won't let a user account add non-contacts.**
+> `InviteToChannelRequest` only works for people the owner account already has a
+> relationship with (mutual contacts / prior messages); adding strangers throws
+> `PeerFloodError`. That's a permission gate, not a rate limit — throttling
+> doesn't help. So direct-add covers your contacts; **everyone else joins by
+> invite link, then gets promoted.**
 
 ```bash
-python -m setup.add_facils            # writes setup/facil_match_report.csv, adds nobody
-# review the report, fix any 'ambiguous' / 'no_handle' rows
-python -m setup.add_facils --commit    # adds the 'matched' facils and makes them admins
+python -m setup.add_facils             # writes facil_match_report.csv, adds nobody
+# fix any 'ambiguous' / 'no_handle' rows (see find_handles below)
+
+python -m setup.add_facils --commit     # adds the ones who are contacts; lists the rest
+python -m setup.invite_links            # prints each group's invite link — share them
+# ...people tap their link and join...
+python -m setup.add_facils --promote    # makes the joined facils admins
 ```
 
-The report lists each facil as `matched`, `ambiguous`, or `no_handle` so you can
-eyeball it before anything runs.
+`--commit` never aborts on the non-contact limit — it adds who it can, then
+prints exactly who needs an invite link. Both `--commit` and `--promote` take
+`--only AM1` to work one group at a time.
 
 ### Year 1s — `/add_year_ones` + the worker
 
