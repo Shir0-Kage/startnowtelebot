@@ -11,15 +11,16 @@ from telegram.ext import CommandHandler
 import storage
 from utils.auth import facil_only
 
-# pull "AM3" / "PM7" out of a group title like "StartNOW! AM3"
-_OG_RE = re.compile(r"\b(AM|PM)(10|[1-9])\b")
+# pull "AM3" / "PM7" out of a group title like "StartNOW! AM3".
+# tolerant of case and a stray space, e.g. "startnow! am 3" -> "AM3".
+_OG_RE = re.compile(r"(?i)\b(AM|PM)\s*(10|[1-9])\b")
 
 
 def _og_from_title(title):
     if not title:
         return None
     m = _OG_RE.search(title)
-    return (m.group(1) + m.group(2)) if m else None
+    return (m.group(1).upper() + m.group(2)) if m else None
 
 
 @facil_only

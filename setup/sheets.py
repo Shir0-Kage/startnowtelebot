@@ -54,7 +54,16 @@ def _rows(text):
 
 # Telegram usernames: 5-32 chars, start with a letter, letters/digits/underscore.
 _USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
-_OG_RE = re.compile(r"^(AM|PM)\d+")
+
+# OG labels in the sheets can be sloppy — trailing notes ("PM9 (add more...)"),
+# stray spaces, or lower case. Match leniently and normalise to a clean code.
+_OG_RE = re.compile(r"^\s*(AM|PM)\s*(10|[1-9])\b", re.IGNORECASE)
+
+
+def og_code(text):
+    """Normalise an OG label to 'AM3' / 'PM10', or None if it isn't one."""
+    m = _OG_RE.match(text or "")
+    return (m.group(1).upper() + m.group(2)) if m else None
 
 
 def normalize_handle(raw):
@@ -83,8 +92,9 @@ def parse_year1(text):
     current = None
     for row in _rows(text):
         first = (row[0] if row else "").strip()
-        if _OG_RE.match(first):
-            current = _OG_RE.match(first).group(0)
+        code = og_code(first)
+        if code:
+            current = code
             groups.setdefault(current, [])
             continue
         if not current or not first or first == "." or first.lower() == "name":
@@ -118,12 +128,13 @@ def parse_facil_groups(text):
     out = []
     for row in _rows(text):
         first = (row[0] if row else "").strip()
-        if not _OG_RE.match(first):
+        code = og_code(first)
+        if not code:
             continue  # skips headers and the 'AM'/'PM' slot separators
         name = row[2].strip() if len(row) > 2 else ""
         if not name:
             continue
-        out.append({"name": name, "group": _OG_RE.match(first).group(0),
+        out.append({"name": name, "group": code,
                     "house": row[1].strip() if len(row) > 1 else ""})
     return out
 
