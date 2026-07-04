@@ -38,11 +38,31 @@ FACIL_RIGHTS = ChatAdminRights(
 )
 
 
+# Handles the name-join can't resolve on its own — people missing from the
+# assessment sheet, or names too ambiguous to pick. Filled in by hand; keyed by
+# the facil's name exactly as it appears in the grouping tab.
+HANDLE_OVERRIDES = {
+    "Ma Anqi": "aqueous27",
+    "Jian YiXuan": "yeet_suan",
+    "Lau Yi Xuan": "itisyixuan",
+    "Kong Jing Yee": "jingyeeeeeeee",
+    "Mihikaa Singh": "mihikaasingh",
+}
+
+_OVERRIDES = {" ".join(k.split()).lower(): v for k, v in HANDLE_OVERRIDES.items()}
+
+
 def match_facils(facils, handles):
     """Join facils (name+group) to handle rows (name+handle) by fuzzy name.
     Returns a row per facil with a status."""
     rows = []
     for f in facils:
+        override = _OVERRIDES.get(" ".join(f["name"].split()).lower())
+        if override:
+            rows.append({"name": f["name"], "group": f["group"],
+                         "house": f["house"], "handle": override,
+                         "status": "matched"})
+            continue
         ftok = sheets.name_tokens(f["name"])
         cands = {}
         for h in handles:
