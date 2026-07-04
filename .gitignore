@@ -10,6 +10,10 @@
 *.session
 *.session-journal
 setup/created_groups.json
+# generated setup output that contains participant PII — never commit
+setup/facil_match_report.csv
+setup/facil_added.json
+setup/*_cache.csv
 
 # python
 __pycache__/

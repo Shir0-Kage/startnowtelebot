@@ -46,6 +46,25 @@ CREATE TABLE IF NOT EXISTS started_users (
     display_name TEXT,
     marked_at    TEXT
 );
+
+-- Facil-triggered jobs for the setup worker (e.g. /add_year_ones).
+CREATE TABLE IF NOT EXISTS group_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id      INTEGER,
+    og           TEXT,          -- 'AM3', 'PM7', ...
+    kind         TEXT,          -- 'year_ones'
+    status       TEXT,          -- 'pending' | 'done'
+    requested_by INTEGER,
+    requested_at TEXT
+);
+
+-- Who the worker has already added, so re-runs don't double-add or re-DM.
+CREATE TABLE IF NOT EXISTS year_one_added (
+    chat_id  INTEGER,
+    handle   TEXT,              -- lowercased, no @
+    added_at TEXT,
+    PRIMARY KEY (chat_id, handle)
+);
 """
 
 
@@ -249,3 +268,56 @@ def get_started():
     with _lock:
         rows = _conn.execute("SELECT * FROM started_users").fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Setup job queue (bot enqueues, the @zzehao worker fulfils)
+# ---------------------------------------------------------------------------
+
+def enqueue_request(chat_id, og, kind, requested_by):
+    with _lock:
+        _conn.execute(
+            """INSERT INTO group_requests
+               (chat_id, og, kind, status, requested_by, requested_at)
+               VALUES (?, ?, ?, 'pending', ?, ?)""",
+            (chat_id, og, kind, requested_by, _now_iso()),
+        )
+        _conn.commit()
+
+
+def pending_requests(kind):
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM group_requests WHERE kind = ? AND status = 'pending' "
+            "ORDER BY id",
+            (kind,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_request_done(request_id):
+    with _lock:
+        _conn.execute(
+            "UPDATE group_requests SET status = 'done' WHERE id = ?",
+            (request_id,),
+        )
+        _conn.commit()
+
+
+def already_added(chat_id, handle):
+    with _lock:
+        row = _conn.execute(
+            "SELECT 1 FROM year_one_added WHERE chat_id = ? AND handle = ?",
+            (chat_id, handle.lower()),
+        ).fetchone()
+    return row is not None
+
+
+def record_added(chat_id, handle):
+    with _lock:
+        _conn.execute(
+            "INSERT OR IGNORE INTO year_one_added (chat_id, handle, added_at) "
+            "VALUES (?, ?, ?)",
+            (chat_id, handle.lower(), _now_iso()),
+        )
+        _conn.commit()

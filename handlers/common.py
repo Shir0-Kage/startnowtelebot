@@ -36,6 +36,7 @@ HELP_TEXT = (
     "/announce &lt;message&gt; — post a formatted announcement\n"
     "/remind &lt;message&gt; — post a short reminder\n"
     "/pinannounce &lt;message&gt; — announce and pin it\n"
+    "/add_year_ones — add this group's Year 1s (from the sheet)\n"
 )
 
 

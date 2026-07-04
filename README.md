@@ -263,6 +263,45 @@ settings block a direct add, the script prints an invite link to send them.
 > The Telethon `*.session` file grants full access to the owner's account — it's
 > gitignored, keep it private.
 
+## Adding facils and Year 1s from the sheets
+
+Both read the StartNOW! Google Sheets (shared "anyone with the link can view",
+so the headless worker can fetch them). Participant data is **never committed** —
+the generated report and caches are gitignored.
+
+### Facils — `setup/add_facils.py`
+
+Handles live in the assessment workbook; AM/PM group assignments live in the
+grouping sheet, joined only by name. So it works in two steps:
+
+```bash
+python -m setup.add_facils            # writes setup/facil_match_report.csv, adds nobody
+# review the report, fix any 'ambiguous' / 'no_handle' rows
+python -m setup.add_facils --commit    # adds the 'matched' facils and makes them admins
+```
+
+The report lists each facil as `matched`, `ambiguous`, or `no_handle` so you can
+eyeball it before anything runs.
+
+### Year 1s — `/add_year_ones` + the worker
+
+Because the bot can't add members, this is a two-part flow:
+
+1. A facil runs **`/add_year_ones`** in their group (e.g. *StartNOW! AM3*). The
+   bot reads the OG from the group name and queues the request.
+2. The worker (run as the owner account) does the adds:
+
+   ```bash
+   python -m setup.add_year_ones --watch    # keep processing requests as they arrive
+   # or: python -m setup.add_year_ones       # process what's queued right now
+   ```
+
+   Each Year 1 is added by their handle. Anyone who can't be added directly
+   (bad handle or locked-down privacy) gets a DM with the group's invite link;
+   anyone the DM can't reach is printed for the facil to follow up.
+
+Run this worker alongside `add_members` (e.g. another tmux window).
+
 ## Where data is stored
 
 Everything persists in a single SQLite file (`bot.db` by default):

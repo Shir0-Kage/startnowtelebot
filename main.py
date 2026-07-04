@@ -16,6 +16,7 @@ from handlers import (
     announcements,
     attendance,
     common,
+    provisioning,
     quests,
     reminders,
     schedule,
@@ -83,6 +84,7 @@ def main():
     settings.register(app)
     attendance.register(app)
     announcements.register(app)
+    provisioning.register(app)
 
     app.add_error_handler(_on_error)
 
