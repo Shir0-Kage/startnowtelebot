@@ -28,16 +28,22 @@ CREATE TABLE IF NOT EXISTS attendance (
     user_id      INTEGER,
     display_name TEXT,
     username     TEXT,
-    slot         TEXT,          -- the group's slot at time of marking
+    slot         TEXT,          -- the group's slot when they voted
+    answer       TEXT,          -- 'Going' | 'Not going' | 'Maybe'
     marked_at    TEXT,          -- ISO timestamp, SGT
     PRIMARY KEY (chat_id, event_key, user_id)
 );
 
-CREATE TABLE IF NOT EXISTS attendance_state (
-    chat_id   INTEGER,
-    event_key TEXT,
-    is_open   INTEGER DEFAULT 1,
-    PRIMARY KEY (chat_id, event_key)
+-- one row per attendance poll the bot posts, so a PollAnswer update (which only
+-- carries the poll id) can be mapped back to its chat + event.
+CREATE TABLE IF NOT EXISTS polls (
+    poll_id    TEXT PRIMARY KEY,
+    chat_id    INTEGER,
+    event_key  TEXT,
+    message_id INTEGER,
+    slot       TEXT,
+    is_open    INTEGER DEFAULT 1,
+    created_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS started_users (
@@ -78,6 +84,10 @@ def init_db():
     _conn.execute("PRAGMA busy_timeout=30000")
     with _lock:
         _conn.executescript(SCHEMA)
+        # migrate older DBs created before the 'answer' column existed
+        cols = [r[1] for r in _conn.execute("PRAGMA table_info(attendance)")]
+        if "answer" not in cols:
+            _conn.execute("ALTER TABLE attendance ADD COLUMN answer TEXT")
         _conn.commit()
 
 
@@ -156,50 +166,72 @@ def groups_by_slot(slot):
 # Attendance
 # ---------------------------------------------------------------------------
 
-def open_attendance(chat_id, event_key):
+def record_poll(poll_id, chat_id, event_key, message_id, slot):
+    """Remember a poll we posted, so its votes can be tied to chat + event."""
     with _lock:
         _conn.execute(
-            """INSERT INTO attendance_state (chat_id, event_key, is_open)
-               VALUES (?, ?, 1)
-               ON CONFLICT(chat_id, event_key) DO UPDATE SET is_open = 1""",
-            (chat_id, event_key),
+            """INSERT OR REPLACE INTO polls
+               (poll_id, chat_id, event_key, message_id, slot, is_open, created_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?)""",
+            (poll_id, chat_id, event_key, message_id, slot, _now_iso()),
         )
         _conn.commit()
 
 
-def close_attendance(chat_id, event_key):
-    with _lock:
-        _conn.execute(
-            """INSERT INTO attendance_state (chat_id, event_key, is_open)
-               VALUES (?, ?, 0)
-               ON CONFLICT(chat_id, event_key) DO UPDATE SET is_open = 0""",
-            (chat_id, event_key),
-        )
-        _conn.commit()
-
-
-def is_open(chat_id, event_key):
+def get_poll(poll_id):
     with _lock:
         row = _conn.execute(
-            "SELECT is_open FROM attendance_state WHERE chat_id = ? AND event_key = ?",
-            (chat_id, event_key),
+            "SELECT * FROM polls WHERE poll_id = ?", (poll_id,)
         ).fetchone()
-    # if we've never posted a check, treat it as not open
-    return bool(row["is_open"]) if row else False
+    return dict(row) if row else None
 
 
-def mark_attendance(chat_id, event_key, user_id, display_name, username, slot):
-    """Record one attendance tap. Returns True if this is a new mark, False if
-    the user was already counted (so we don't double-count)."""
+def open_poll_messages(chat_id, event_key):
+    """message_ids of still-open polls for an event — used to stop them."""
     with _lock:
-        cur = _conn.execute(
-            """INSERT OR IGNORE INTO attendance
-               (chat_id, event_key, user_id, display_name, username, slot, marked_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (chat_id, event_key, user_id, display_name, username, slot, _now_iso()),
+        rows = _conn.execute(
+            "SELECT message_id FROM polls "
+            "WHERE chat_id = ? AND event_key = ? AND is_open = 1",
+            (chat_id, event_key),
+        ).fetchall()
+    return [r["message_id"] for r in rows]
+
+
+def close_event_polls(chat_id, event_key):
+    with _lock:
+        _conn.execute(
+            "UPDATE polls SET is_open = 0 WHERE chat_id = ? AND event_key = ?",
+            (chat_id, event_key),
         )
         _conn.commit()
-        return cur.rowcount > 0
+
+
+def record_vote(chat_id, event_key, user_id, display_name, username, slot, answer):
+    """Store (or update) one person's poll answer for an event."""
+    with _lock:
+        _conn.execute(
+            """INSERT INTO attendance
+               (chat_id, event_key, user_id, display_name, username, slot, answer, marked_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(chat_id, event_key, user_id) DO UPDATE SET
+                   display_name = excluded.display_name,
+                   username     = excluded.username,
+                   slot         = excluded.slot,
+                   answer       = excluded.answer,
+                   marked_at    = excluded.marked_at""",
+            (chat_id, event_key, user_id, display_name, username, slot, answer, _now_iso()),
+        )
+        _conn.commit()
+
+
+def remove_vote(chat_id, event_key, user_id):
+    """Drop someone's answer (they retracted their vote)."""
+    with _lock:
+        _conn.execute(
+            "DELETE FROM attendance WHERE chat_id = ? AND event_key = ? AND user_id = ?",
+            (chat_id, event_key, user_id),
+        )
+        _conn.commit()
 
 
 def get_attendance(chat_id, event_key):
@@ -214,30 +246,18 @@ def get_attendance(chat_id, event_key):
 
 
 def clear_attendance(chat_id, event_key):
-    """Wipe attendance for one event in one chat. Returns rows removed."""
+    """Wipe answers (and poll records) for one event in one chat. Returns rows removed."""
     with _lock:
         cur = _conn.execute(
             "DELETE FROM attendance WHERE chat_id = ? AND event_key = ?",
             (chat_id, event_key),
         )
         _conn.execute(
-            "DELETE FROM attendance_state WHERE chat_id = ? AND event_key = ?",
+            "DELETE FROM polls WHERE chat_id = ? AND event_key = ?",
             (chat_id, event_key),
         )
         _conn.commit()
         return cur.rowcount
-
-
-def attendance_counts(chat_id):
-    """Per-event mark counts for a chat: list of (event_key, count)."""
-    with _lock:
-        rows = _conn.execute(
-            """SELECT event_key, COUNT(*) AS n FROM attendance
-               WHERE chat_id = ?
-               GROUP BY event_key""",
-            (chat_id,),
-        ).fetchall()
-    return [(r["event_key"], r["n"]) for r in rows]
 
 
 def all_attendance(chat_id):

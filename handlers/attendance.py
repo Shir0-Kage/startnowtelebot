@@ -1,19 +1,28 @@
-"""Attendance collection.
+"""Attendance via a group poll.
 
-This is NOT an RSVP. A facil opens an attendance check during/after an event,
-participants tap a button, and we record who actually showed up — once each.
+A facil posts (or the bot auto-posts, 1 day before a meet-up) a non-anonymous
+poll — Going / Not going / Maybe. Each vote is recorded as it comes in, so
+facils can export who said what. It's a headcount, not an RSVP gate.
 """
 
 import csv
 import io
+import logging
+from datetime import datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.ext import CallbackQueryHandler, CommandHandler
+from telegram.ext import CallbackQueryHandler, CommandHandler, PollAnswerHandler
 
 import storage
+from config import TIMEZONE
 from data import events
 from utils.auth import facil_only, is_facilitator
-from utils.text import chunk_text, display_name
+from utils.text import display_name
+
+log = logging.getLogger(__name__)
+
+POLL_OPTIONS = ["✅ Going", "❌ Not going", "🤔 Maybe"]
+ANSWER_LABELS = ["Going", "Not going", "Maybe"]  # stored value, by option index
 
 
 def _event_label(key):
@@ -21,46 +30,44 @@ def _event_label(key):
     return ev["short"] if ev else key
 
 
-def _check_text(ev):
-    return (
-        f"📋 <b>Attendance Check: {ev['short']}</b>\n\n"
-        "If you're here for today's session, tap the button below to mark your "
-        "attendance!"
+def _time_label(ev, slot):
+    if events.is_meetup(ev):
+        if slot in ("AM", "PM"):
+            return f"{slot} {events.slot_time_str(ev, slot)} SGT"
+        return (f"AM {events.slot_time_str(ev, 'AM')} / "
+                f"PM {events.slot_time_str(ev, 'PM')} SGT")
+    return ev["time"].strftime("%H%M") + "H SGT"
+
+
+def _poll_question(ev, slot):
+    date = f"{ev['date'].day} {ev['date'].strftime('%b')}"
+    return f"{ev['short']} — are you coming? ({date}, {_time_label(ev, slot)})"
+
+
+async def _send_poll(bot, chat_id, ev, slot):
+    msg = await bot.send_poll(
+        chat_id=chat_id,
+        question=_poll_question(ev, slot),
+        options=POLL_OPTIONS,
+        is_anonymous=False,           # so we get each voter in the PollAnswer
+        allows_multiple_answers=False,
     )
-
-
-def _check_keyboard(key):
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Mark Attendance", callback_data=f"attmark:{key}")]]
-    )
-
-
-async def _open_check(update, context, ev):
-    """Post the attendance check for an event and mark the session open."""
-    chat = update.effective_chat
-    storage.ensure_group(chat.id, chat.title or "")
-    storage.open_attendance(chat.id, ev["key"])
-    await context.bot.send_message(
-        chat_id=chat.id,
-        text=_check_text(ev),
-        parse_mode="HTML",
-        reply_markup=_check_keyboard(ev["key"]),
-    )
+    storage.record_poll(msg.poll.id, chat_id, ev["key"], msg.message_id, slot)
+    return msg
 
 
 # ---------------------------------------------------------------------------
-# /attendance
+# /attendance — post a poll (facil), or show a picker
 # ---------------------------------------------------------------------------
 
 async def attendance_command(update, context):
     chat = update.effective_chat
     storage.ensure_group(chat.id, chat.title or "")
 
-    # /attendance <event> — facil opens a check straight away
-    if context.args:
+    if context.args:  # /attendance <event> — post the poll straight away
         if not await is_facilitator(update, context):
             await update.effective_message.reply_text(
-                "Only facils can open an attendance check 🙏"
+                "Only facils can start an attendance poll 🙏"
             )
             return
         ev = events.find_event(" ".join(context.args))
@@ -69,133 +76,58 @@ async def attendance_command(update, context):
                 "I don't recognise that event. Try /attendance to see the list."
             )
             return
-        await _open_check(update, context, ev)
+        await _send_poll(context.bot, chat.id, ev, storage.get_slot(chat.id))
         return
 
-    # /attendance — show a picker
     rows = []
     pool = events.MEETUPS + events.ENGAGEMENTS
     for i in range(0, len(pool), 2):
-        row = [
+        rows.append([
             InlineKeyboardButton(ev["short"], callback_data=f"attopen:{ev['key']}")
             for ev in pool[i : i + 2]
-        ]
-        rows.append(row)
-
+        ])
     await update.effective_message.reply_text(
-        "📋 <b>Attendance</b>\n\nFacils — pick an event to open an attendance "
-        "check for this group:",
+        "📋 <b>Attendance</b>\n\nFacils — pick an event to post an attendance "
+        "poll for this group:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
 
 async def attopen_button(update, context):
-    """Facil tapped an event in the /attendance picker."""
     query = update.callback_query
     if not await is_facilitator(update, context):
-        await query.answer("Only facils can open attendance 🙏", show_alert=True)
+        await query.answer("Only facils can start attendance 🙏", show_alert=True)
         return
-
     await query.answer()
-    key = query.data.split(":", 1)[1]
-    ev = events.EVENTS_BY_KEY.get(key)
+    ev = events.EVENTS_BY_KEY.get(query.data.split(":", 1)[1])
     if not ev:
         return
-    await _open_check(update, context, ev)
-
-
-# ---------------------------------------------------------------------------
-# Marking (button tap by participants)
-# ---------------------------------------------------------------------------
-
-async def attmark_button(update, context):
-    query = update.callback_query
-    key = query.data.split(":", 1)[1]
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if not storage.is_open(chat.id, key):
-        await query.answer(
-            "Attendance for this event is closed 🙏", show_alert=True
-        )
-        return
-
-    slot = storage.get_slot(chat.id)
-    is_new = storage.mark_attendance(
-        chat_id=chat.id,
-        event_key=key,
-        user_id=user.id,
-        display_name=display_name(user),
-        username=user.username or "",
-        slot=slot,
-    )
-
-    if is_new:
-        await query.answer("Attendance marked — thank you! ❤️")
-    else:
-        await query.answer("You're already marked down — thanks! ❤️")
-
-
-# ---------------------------------------------------------------------------
-# Summaries
-# ---------------------------------------------------------------------------
-
-async def attendance_summary_command(update, context):
     chat = update.effective_chat
     storage.ensure_group(chat.id, chat.title or "")
+    await _send_poll(context.bot, chat.id, ev, storage.get_slot(chat.id))
 
-    # /attendance_summary <event> — detailed present list
-    if context.args:
-        ev = events.find_event(" ".join(context.args))
-        if not ev:
-            await update.effective_message.reply_text(
-                "I don't recognise that event. Try /attendance_summary on its "
-                "own to see what's been collected."
-            )
-            return
-        await _send_event_summary(update, chat.id, ev)
+
+# ---------------------------------------------------------------------------
+# Votes — a PollAnswer only carries the poll id, so we map it back via storage
+# ---------------------------------------------------------------------------
+
+async def on_poll_answer(update, context):
+    pa = update.poll_answer
+    if pa is None or pa.user is None:
         return
-
-    # /attendance_summary — overview across events
-    counts = storage.attendance_counts(chat.id)
-    if not counts:
-        await update.effective_message.reply_text(
-            "No attendance collected in this group yet. Facils can start one "
-            "with /attendance 🙂"
-        )
+    poll = storage.get_poll(pa.poll_id)
+    if not poll:
         return
-
-    lines = ["📊 <b>Attendance so far</b>\n"]
-    for key, n in counts:
-        lines.append(f"• {_event_label(key)} — {n} marked present")
-    lines.append(
-        "\nUse /attendance_summary &lt;event&gt; to see the full name list."
+    if not pa.option_ids:  # they retracted their vote
+        storage.remove_vote(poll["chat_id"], poll["event_key"], pa.user.id)
+        return
+    idx = pa.option_ids[0]
+    answer = ANSWER_LABELS[idx] if idx < len(ANSWER_LABELS) else "?"
+    storage.record_vote(
+        poll["chat_id"], poll["event_key"], pa.user.id,
+        display_name(pa.user), pa.user.username or "", poll["slot"], answer,
     )
-    await update.effective_message.reply_html("\n".join(lines))
-
-
-async def _send_event_summary(update, chat_id, ev):
-    records = storage.get_attendance(chat_id, ev["key"])
-    header = f"📊 <b>Attendance Summary: {ev['short']}</b>\n\n"
-
-    if not records:
-        await update.effective_message.reply_html(
-            header + "No one's been marked present yet."
-        )
-        return
-
-    lines = [header, f"Total marked present: <b>{len(records)}</b>\n", "Present:"]
-    for r in records:
-        name = r["display_name"] or "Someone"
-        handle = f" (@{r['username']})" if r["username"] else ""
-        lines.append(f"• {name}{handle}")
-    lines.append("\nUse this to help keep track of who attended.")
-
-    # long lists get split across messages
-    full = "\n".join(lines)
-    for piece in chunk_text(full):
-        await update.effective_message.reply_html(piece)
 
 
 # ---------------------------------------------------------------------------
@@ -213,11 +145,15 @@ async def close_attendance_command(update, context):
     if not ev:
         await update.effective_message.reply_text("I don't recognise that event.")
         return
-
     chat = update.effective_chat
-    storage.close_attendance(chat.id, ev["key"])
+    for mid in storage.open_poll_messages(chat.id, ev["key"]):
+        try:
+            await context.bot.stop_poll(chat.id, mid)
+        except Exception as exc:
+            log.warning("stop_poll failed (%s): %s", mid, exc)
+    storage.close_event_polls(chat.id, ev["key"])
     await update.effective_message.reply_text(
-        f"Attendance for {ev['short']} is now closed. No more taps will count. ✅"
+        f"Closed the {ev['short']} attendance poll. ✅"
     )
 
 
@@ -232,11 +168,10 @@ async def clear_attendance_command(update, context):
     if not ev:
         await update.effective_message.reply_text("I don't recognise that event.")
         return
-
     chat = update.effective_chat
     removed = storage.clear_attendance(chat.id, ev["key"])
     await update.effective_message.reply_text(
-        f"Cleared {removed} record(s) for {ev['short']}. Starting fresh. 🧹"
+        f"Cleared {removed} answer(s) for {ev['short']}. Starting fresh. 🧹"
     )
 
 
@@ -245,44 +180,72 @@ async def export_attendance_command(update, context):
     chat = update.effective_chat
     storage.ensure_group(chat.id, chat.title or "")
     records = storage.all_attendance(chat.id)
-
     if not records:
         await update.effective_message.reply_text(
-            "Nothing to export yet — no attendance collected in this group."
+            "Nothing to export yet — no poll answers in this group."
         )
         return
 
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(
-        ["event", "user_id", "display_name", "username", "slot", "marked_at"]
+        ["event", "user_id", "display_name", "username", "slot", "answer", "voted_at"]
     )
     for r in records:
-        writer.writerow(
-            [
-                _event_label(r["event_key"]),
-                r["user_id"],
-                r["display_name"],
-                r["username"],
-                r["slot"],
-                r["marked_at"],
-            ]
-        )
-
+        writer.writerow([
+            _event_label(r["event_key"]), r["user_id"], r["display_name"],
+            r["username"], r["slot"], r.get("answer"), r["marked_at"],
+        ])
     data = buf.getvalue().encode("utf-8-sig")  # BOM so Excel reads UTF-8 cleanly
-    filename = f"attendance_{chat.id}.csv"
     await context.bot.send_document(
         chat_id=chat.id,
-        document=InputFile(io.BytesIO(data), filename=filename),
+        document=InputFile(io.BytesIO(data), filename=f"attendance_{chat.id}.csv"),
         caption="Here's this group's attendance so far 📎",
     )
 
 
+# ---------------------------------------------------------------------------
+# Auto-send: a poll 1 day before each meet-up's slot time (slot-aware)
+# ---------------------------------------------------------------------------
+
+async def _auto_poll_job(context):
+    data = context.job.data
+    ev = events.EVENTS_BY_KEY.get(data["key"])
+    slot = data["slot"]
+    if not ev:
+        return
+    for g in storage.groups_by_slot(slot):
+        try:
+            await _send_poll(context.bot, g["chat_id"], ev, slot)
+        except Exception as exc:
+            log.warning("auto-poll to %s failed: %s", g["chat_id"], exc)
+
+
+def schedule_attendance_polls(app):
+    """Queue an attendance poll 1 day before each meet-up's AM/PM slot time."""
+    jq = app.job_queue
+    if jq is None:
+        return
+    now = datetime.now(TIMEZONE)
+    queued = 0
+    for ev in events.MEETUPS:
+        for slot in ("AM", "PM"):
+            when = events.meetup_slot_dt(ev, slot) - timedelta(days=1)
+            if when <= now:
+                continue
+            jq.run_once(
+                _auto_poll_job, when=when,
+                data={"key": ev["key"], "slot": slot},
+                name=f"poll:{ev['key']}:{slot}",
+            )
+            queued += 1
+    log.info("scheduled %d attendance poll(s)", queued)
+
+
 def register(app):
     app.add_handler(CommandHandler("attendance", attendance_command))
-    app.add_handler(CommandHandler("attendance_summary", attendance_summary_command))
     app.add_handler(CommandHandler("close_attendance", close_attendance_command))
     app.add_handler(CommandHandler("clear_attendance", clear_attendance_command))
     app.add_handler(CommandHandler("export_attendance", export_attendance_command))
-    app.add_handler(CallbackQueryHandler(attmark_button, pattern=r"^attmark:"))
     app.add_handler(CallbackQueryHandler(attopen_button, pattern=r"^attopen:"))
+    app.add_handler(PollAnswerHandler(on_poll_answer))

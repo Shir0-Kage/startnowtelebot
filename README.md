@@ -36,8 +36,7 @@ Built with Python and [python-telegram-bot](https://docs.python-telegram-bot.org
 | `/meetups` | The three official meet-ups |
 | `/engagements` | Optional engagement sessions |
 | `/slot` | Whether this group is AM or PM |
-| `/attendance` | Pick an event to collect attendance for |
-| `/attendance_summary <event>` | See who's marked present |
+| `/attendance` | Post an attendance poll (Going / Not going / Maybe) |
 
 **Facilitators only** (group admins, or IDs in `FACILITATOR_IDS`)
 
@@ -45,10 +44,10 @@ Built with Python and [python-telegram-bot](https://docs.python-telegram-bot.org
 | --- | --- |
 | `/setslot am` / `/setslot pm` | Assign this group's meet-up slot |
 | `/reminders on` / `/reminders off` | Toggle reminders for this group |
-| `/attendance <event>` | Open an attendance check |
-| `/close_attendance <event>` | Stop collecting for an event |
-| `/clear_attendance <event>` | Reset an event's records |
-| `/export_attendance` | Download this group's records as CSV |
+| `/attendance <event>` | Post an attendance poll for an event |
+| `/close_attendance <event>` | Close the poll |
+| `/clear_attendance <event>` | Reset an event's answers |
+| `/export_attendance` | Download answers (incl. Going/Maybe) as CSV |
 | `/announce <message>` | Post a formatted announcement |
 | `/remind <message>` | Post a short reminder |
 | `/pinannounce <message>` | Announce and pin it |
@@ -368,8 +367,8 @@ gitignored — local assets, not committed.
 Everything persists in a single SQLite file (`bot.db` by default):
 
 - **groups** — chat ID, group name, slot (AM/PM/unset), reminders on/off
-- **attendance** — one row per person per event, with slot and timestamp
-- **attendance_state** — whether a check is open or closed
+- **attendance** — one row per person per event: slot, answer, timestamp
+- **polls** — maps each attendance poll to its group + event (for vote capture)
 
 Back it up by copying `bot.db`. Change its location with `DB_PATH` in `.env`.
 
@@ -389,7 +388,7 @@ handlers/
   quests.py             # /quests, /quest
   schedule.py           # /schedule, /next, /meetups, /engagements
   settings.py           # /setslot, /slot, /reminders
-  attendance.py         # attendance commands + button
+  attendance.py         # attendance poll + vote capture + auto-send
   announcements.py      # /announce, /remind, /pinannounce
   reminders.py          # scheduled reminder jobs
 utils/

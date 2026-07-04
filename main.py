@@ -7,7 +7,7 @@ Make sure BOT_TOKEN is set first (see the README).
 import logging
 import sys
 
-from telegram import BotCommand
+from telegram import BotCommand, Update
 from telegram.ext import Application
 
 import config
@@ -45,8 +45,7 @@ MENU_COMMANDS = [
     BotCommand("meetups", "The official meet-ups"),
     BotCommand("engagements", "Optional sessions"),
     BotCommand("slot", "Is this group AM or PM?"),
-    BotCommand("attendance", "Collect attendance"),
-    BotCommand("attendance_summary", "See who's present"),
+    BotCommand("attendance", "Post an attendance poll"),
 ]
 
 
@@ -54,6 +53,7 @@ async def _on_startup(app):
     """Runs once after the app is built: set the menu and queue reminders."""
     await app.bot.set_my_commands(MENU_COMMANDS)
     reminders.schedule_reminders(app)
+    attendance.schedule_attendance_polls(app)
     log.info("bot is up and running")
 
 
@@ -88,8 +88,9 @@ def main():
 
     app.add_error_handler(_on_error)
 
-    # long-polling — simplest way to run; no public URL needed
-    app.run_polling(allowed_updates=None)
+    # long-polling — simplest way to run; no public URL needed.
+    # ALL_TYPES so we receive poll_answer updates (attendance votes).
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
