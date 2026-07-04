@@ -64,6 +64,8 @@ HANDLE_OVERRIDES = {
     "Lau Yi Xuan": "itisyixuan",
     "Kong Jing Yee": "jingyeeeeeeee",
     "Mihikaa Singh": "mihikaasingh",
+    "Jedd Lawrence": "harurot",             # @haruot was wrong
+    "Yap Jia Hui, Selin": "veggiemuncher1234",
 }
 
 _OVERRIDES = {" ".join(k.split()).lower(): v for k, v in HANDLE_OVERRIDES.items()}
