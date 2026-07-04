@@ -1,16 +1,15 @@
 """Attendance via a group poll.
 
 A facil posts (or the bot auto-posts, 1 day before a meet-up) a non-anonymous
-poll — Going / Not going / Maybe. Each vote is recorded as it comes in, so
-facils can export who said what. It's a headcount, not an RSVP gate.
+poll — Going / Not going / Maybe. Each vote is recorded as it comes in. Because
+the poll is non-anonymous, everyone can see who voted what. It's a headcount,
+not an RSVP gate.
 """
 
-import csv
-import io
 import logging
 from datetime import datetime, timedelta
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler, CommandHandler, PollAnswerHandler
 
 import storage
@@ -23,11 +22,6 @@ log = logging.getLogger(__name__)
 
 POLL_OPTIONS = ["✅ Going", "❌ Not going", "🤔 Maybe"]
 ANSWER_LABELS = ["Going", "Not going", "Maybe"]  # stored value, by option index
-
-
-def _event_label(key):
-    ev = events.EVENTS_BY_KEY.get(key)
-    return ev["short"] if ev else key
 
 
 def _time_label(ev, slot):
@@ -157,53 +151,6 @@ async def close_attendance_command(update, context):
     )
 
 
-@facil_only
-async def clear_attendance_command(update, context):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Usage: /clear_attendance <event>, e.g. /clear_attendance meetup1"
-        )
-        return
-    ev = events.find_event(" ".join(context.args))
-    if not ev:
-        await update.effective_message.reply_text("I don't recognise that event.")
-        return
-    chat = update.effective_chat
-    removed = storage.clear_attendance(chat.id, ev["key"])
-    await update.effective_message.reply_text(
-        f"Cleared {removed} answer(s) for {ev['short']}. Starting fresh. 🧹"
-    )
-
-
-@facil_only
-async def export_attendance_command(update, context):
-    chat = update.effective_chat
-    storage.ensure_group(chat.id, chat.title or "")
-    records = storage.all_attendance(chat.id)
-    if not records:
-        await update.effective_message.reply_text(
-            "Nothing to export yet — no poll answers in this group."
-        )
-        return
-
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(
-        ["event", "user_id", "display_name", "username", "slot", "answer", "voted_at"]
-    )
-    for r in records:
-        writer.writerow([
-            _event_label(r["event_key"]), r["user_id"], r["display_name"],
-            r["username"], r["slot"], r.get("answer"), r["marked_at"],
-        ])
-    data = buf.getvalue().encode("utf-8-sig")  # BOM so Excel reads UTF-8 cleanly
-    await context.bot.send_document(
-        chat_id=chat.id,
-        document=InputFile(io.BytesIO(data), filename=f"attendance_{chat.id}.csv"),
-        caption="Here's this group's attendance so far 📎",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Auto-send: a poll 1 day before each meet-up's slot time (slot-aware)
 # ---------------------------------------------------------------------------
@@ -245,7 +192,5 @@ def schedule_attendance_polls(app):
 def register(app):
     app.add_handler(CommandHandler("attendance", attendance_command))
     app.add_handler(CommandHandler("close_attendance", close_attendance_command))
-    app.add_handler(CommandHandler("clear_attendance", clear_attendance_command))
-    app.add_handler(CommandHandler("export_attendance", export_attendance_command))
     app.add_handler(CallbackQueryHandler(attopen_button, pattern=r"^attopen:"))
     app.add_handler(PollAnswerHandler(on_poll_answer))

@@ -234,42 +234,6 @@ def remove_vote(chat_id, event_key, user_id):
         _conn.commit()
 
 
-def get_attendance(chat_id, event_key):
-    with _lock:
-        rows = _conn.execute(
-            """SELECT * FROM attendance
-               WHERE chat_id = ? AND event_key = ?
-               ORDER BY marked_at""",
-            (chat_id, event_key),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def clear_attendance(chat_id, event_key):
-    """Wipe answers (and poll records) for one event in one chat. Returns rows removed."""
-    with _lock:
-        cur = _conn.execute(
-            "DELETE FROM attendance WHERE chat_id = ? AND event_key = ?",
-            (chat_id, event_key),
-        )
-        _conn.execute(
-            "DELETE FROM polls WHERE chat_id = ? AND event_key = ?",
-            (chat_id, event_key),
-        )
-        _conn.commit()
-        return cur.rowcount
-
-
-def all_attendance(chat_id):
-    """Every attendance row for a chat — used for CSV export."""
-    with _lock:
-        rows = _conn.execute(
-            "SELECT * FROM attendance WHERE chat_id = ? ORDER BY event_key, marked_at",
-            (chat_id,),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
 # ---------------------------------------------------------------------------
 # Who has messaged the bot /start (used by the group-provisioning scripts)
 # ---------------------------------------------------------------------------

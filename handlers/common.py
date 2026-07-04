@@ -31,8 +31,6 @@ HELP_TEXT = (
     "/reminders on|off — toggle reminders for this group\n"
     "/attendance &lt;event&gt; — post an attendance poll for an event\n"
     "/close_attendance &lt;event&gt; — close the poll\n"
-    "/clear_attendance &lt;event&gt; — reset an event's answers\n"
-    "/export_attendance — download answers (incl. Going/Maybe) as CSV\n"
     "/announce &lt;message&gt; — post a formatted announcement\n"
     "/remind &lt;message&gt; — post a short reminder\n"
     "/pinannounce &lt;message&gt; — announce and pin it\n"

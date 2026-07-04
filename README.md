@@ -46,8 +46,6 @@ Built with Python and [python-telegram-bot](https://docs.python-telegram-bot.org
 | `/reminders on` / `/reminders off` | Toggle reminders for this group |
 | `/attendance <event>` | Post an attendance poll for an event |
 | `/close_attendance <event>` | Close the poll |
-| `/clear_attendance <event>` | Reset an event's answers |
-| `/export_attendance` | Download answers (incl. Going/Maybe) as CSV |
 | `/announce <message>` | Post a formatted announcement |
 | `/remind <message>` | Post a short reminder |
 | `/pinannounce <message>` | Announce and pin it |
