@@ -334,11 +334,11 @@ work, but **stop the worker first** before running one. If you forget, the
 script exits with a clear "session in use" message instead of locking up. The
 worker is safe to run next to the bot (`main.py`) — they use different files.
 
-**The worker also runs the facil add + promote once a day at 06:00 SGT** (add
-contacts / DM invite links to the rest, then promote whoever's joined). It's
-idempotent, so it keeps trying each morning until everyone's in — no manual
-`add_facils --commit` needed once the worker is running. Change the hour via
-`FACIL_HOUR` in `setup/worker.py`.
+**The worker also runs the facil add + promote once, at 06:00 SGT the morning
+after it's first started** (add contacts / DM invite links to the rest, then
+promote whoever's joined) — a single run, not recurring. It's remembered in
+`setup/facil_task_state.json`; delete that file to arm it again. Change the hour
+via `FACIL_HOUR` in `setup/worker.py`.
 
 ### Group photo — `setup/set_group_photo.py`
 

@@ -17,7 +17,7 @@ stop this worker first — only one Telethon script can use the session at a tim
 import asyncio
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telethon.errors import PeerFloodError
 
@@ -29,9 +29,10 @@ from setup.client import start_client
 INTERVAL = 20
 PEERFLOOD_BACKOFF = 3600  # if Telegram flags us for spam, back off an hour
 
-# Run the facil add + promote once a day at this SGT hour.
+# Run the facil add + promote ONCE, at this SGT hour on the morning after the
+# worker is first started (one-time, not recurring).
 FACIL_HOUR = 6
-_STATE = os.path.join(os.path.dirname(__file__), "facil_daily_state.json")
+_STATE = os.path.join(os.path.dirname(__file__), "facil_task_state.json")
 
 # (label, one-pass coroutine) — reuses each feature's existing cycle
 JOBS = [
@@ -40,35 +41,46 @@ JOBS = [
 ]
 
 
-def _facils_ran_on():
+def _load_state():
     try:
         with open(_STATE) as f:
-            return json.load(f).get("last_run")
+            return json.load(f)
     except Exception:
-        return None
+        return {}
 
 
-def _set_facils_ran(day):
+def _save_state(state):
     with open(_STATE, "w") as f:
-        json.dump({"last_run": day}, f)
+        json.dump(state, f)
 
 
-async def _maybe_daily_facils(client):
-    """Once a day at ~0600 SGT, add facils and promote whoever's joined."""
-    now = datetime.now(TIMEZONE)
-    today = now.strftime("%Y-%m-%d")
-    if now.hour != FACIL_HOUR or _facils_ran_on() == today:
+async def _maybe_facil_once(client):
+    """Run the facil add + promote a single time, at FACIL_HOUR SGT the day
+    after the worker first starts. Persisted, so it never repeats."""
+    state = _load_state()
+    if state.get("done"):
         return
-    _set_facils_ran(today)  # mark first, so a mid-run restart doesn't repeat
-    print(f"[{now:%H:%M} SGT] daily facil add + promote")
-    await add_facils.run_facils(client)
+    now = datetime.now(TIMEZONE)
+    if "run_on" not in state:
+        run_on = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        state["run_on"] = run_on
+        _save_state(state)
+        print(f"facil task armed for {run_on} {FACIL_HOUR:02d}00 SGT (one-time)")
+        return
+    target = datetime.strptime(state["run_on"], "%Y-%m-%d").replace(
+        hour=FACIL_HOUR, tzinfo=TIMEZONE)
+    if now >= target:
+        state["done"] = True
+        _save_state(state)  # mark first, so a mid-run restart won't repeat it
+        print(f"[{now:%Y-%m-%d %H:%M} SGT] one-time facil add + promote")
+        await add_facils.run_facils(client)
 
 
 async def run():
     storage.init_db()
     client = await start_client()
-    print(f"worker running (add_members + add_year_ones; facils daily at "
-          f"{FACIL_HOUR:02d}00 SGT) — Ctrl-c to stop")
+    print(f"worker running (add_members + add_year_ones; facils once at "
+          f"{FACIL_HOUR:02d}00 SGT tomorrow) — Ctrl-c to stop")
     try:
         while True:
             for label, cycle in JOBS:
@@ -81,9 +93,9 @@ async def run():
                 except Exception as exc:
                     print(f"{label} cycle error ({exc}); will retry next tick")
             try:
-                await _maybe_daily_facils(client)
+                await _maybe_facil_once(client)
             except Exception as exc:
-                print(f"daily facil task error ({exc}); will try again tomorrow")
+                print(f"facil task error ({exc})")
             await asyncio.sleep(INTERVAL)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("stopped.")
