@@ -321,16 +321,25 @@ worker is safe to run next to the bot (`main.py`) — they use different files.
 ### Group photo — `setup/set_group_photo.py`
 
 Sets the same profile photo on every group (reads the group list from the
-manifest). Put the image on the machine first, then:
+manifest). By default it **auto-crops the transparent margin (zoom in) and
+flattens transparency onto a solid colour**, because Telegram renders a
+transparent background as a black border. Put the image on the machine first,
+then:
 
 ```bash
-python -m setup.set_group_photo --dry-run     # list the groups, change nothing
+python -m setup.set_group_photo --dry-run     # prepares the image + lists groups, uploads nothing
 python -m setup.set_group_photo               # uses setup/group_photo.png
-python -m setup.set_group_photo --image path/to/logo.png
+python -m setup.set_group_photo --zoom 1.2     # crop in a bit more
+python -m setup.set_group_photo --bg FFFFFF    # force a background colour (default: auto)
+python -m setup.set_group_photo --raw          # upload untouched (no crop/flatten)
 ```
 
-A roughly square image works best (Telegram crops it to a circle). The image
-file is gitignored — it's a local asset, not committed.
+`--dry-run` writes the prepared image next to the source (`*.prepared.png`) so
+you can `scp` it back and eyeball it before uploading. The image files are
+gitignored — local assets, not committed.
+
+> Stop the worker first (`setup.worker`) — only one Telethon script can use the
+> session at a time.
 
 ## Where data is stored
 

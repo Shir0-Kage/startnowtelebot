@@ -5,3 +5,5 @@ python-dotenv>=1.0
 tzdata>=2024.1
 # only needed for the one-time group setup scripts in setup/ (user-account API)
 telethon>=1.36,<2
+# used by set_group_photo.py to flatten transparency + crop the group photo
+Pillow>=10.0
