@@ -78,6 +78,20 @@ CREATE TABLE IF NOT EXISTS link_sent (
     og      TEXT,
     sent_at TEXT
 );
+
+-- OGs a facil has opened via /add_year_ones (Year 1s can be let in).
+CREATE TABLE IF NOT EXISTS opened_ogs (
+    og        TEXT PRIMARY KEY,
+    opened_at TEXT
+);
+
+-- Year 1s who /started before their OG was opened — held until the facil's
+-- command. OG comes from their deep link, so this survives a wrong handle.
+CREATE TABLE IF NOT EXISTS year1_waiting (
+    user_id INTEGER PRIMARY KEY,
+    og      TEXT,
+    since   TEXT
+);
 """
 
 
@@ -280,6 +294,46 @@ def link_sent_to(user_id):
             "SELECT og FROM link_sent WHERE user_id = ?", (user_id,)
         ).fetchone()
     return row["og"] if row else None
+
+
+def open_og(og):
+    with _lock:
+        _conn.execute(
+            "INSERT OR REPLACE INTO opened_ogs (og, opened_at) VALUES (?, ?)",
+            (og, _now_iso()),
+        )
+        _conn.commit()
+
+
+def is_og_opened(og):
+    with _lock:
+        row = _conn.execute(
+            "SELECT 1 FROM opened_ogs WHERE og = ?", (og,)
+        ).fetchone()
+    return row is not None
+
+
+def add_waiting(user_id, og):
+    with _lock:
+        _conn.execute(
+            "INSERT OR REPLACE INTO year1_waiting (user_id, og, since) VALUES (?, ?, ?)",
+            (user_id, og, _now_iso()),
+        )
+        _conn.commit()
+
+
+def waiting_for_og(og):
+    with _lock:
+        rows = _conn.execute(
+            "SELECT user_id FROM year1_waiting WHERE og = ?", (og,)
+        ).fetchall()
+    return [r["user_id"] for r in rows]
+
+
+def remove_waiting(user_id):
+    with _lock:
+        _conn.execute("DELETE FROM year1_waiting WHERE user_id = ?", (user_id,))
+        _conn.commit()
 
 
 # ---------------------------------------------------------------------------

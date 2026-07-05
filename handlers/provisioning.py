@@ -20,8 +20,9 @@ from utils.auth import facil_only
 
 log = logging.getLogger(__name__)
 
-_OG_RE = re.compile(r"(?i)\b(AM|PM)\s*(10|[1-9])\b")     # inside a title
-_OG_EXACT = re.compile(r"(?i)^(AM|PM)(10|[1-9])$")        # a bare payload
+_OG_RE = re.compile(r"(?i)\b(AM|PM)\s*(10|[1-9])\b")           # inside a title
+# deep-link payload: 'AM3' (Year 1, held) or 'facil-AM3' (facil, immediate)
+_PAYLOAD_RE = re.compile(r"(?i)^(facil-)?(AM|PM)(10|[1-9])$")
 
 _year1_map = None    # username (lower) -> OG, built from the sheet on first use
 _link_cache = {}     # OG -> invite link
@@ -48,16 +49,20 @@ def _year1_og_map():
     return _year1_map
 
 
-def _og_for(args, user):
-    # 1) deep-link payload, e.g. /start AM3
+def _role_og(args, user):
+    """(role, OG) from a deep-link payload or @username match. role is 'facil'
+    (get the link now) or 'year1' (held until the OG is opened). (None, None)
+    if we can't tell."""
     if args:
-        m = _OG_EXACT.match(args[0].strip())
+        m = _PAYLOAD_RE.match(args[0].strip())
         if m:
-            return m.group(1).upper() + m.group(2)
-    # 2) match their @username against the Year 1 sheet
+            role = "facil" if m.group(1) else "year1"
+            return role, (m.group(2).upper() + m.group(3))
     if user and user.username:
-        return _year1_og_map().get(user.username.lower())
-    return None
+        og = _year1_og_map().get(user.username.lower())
+        if og:
+            return "year1", og
+    return None, None
 
 
 async def _group_link(bot, og):
@@ -86,19 +91,31 @@ def _welcome(og, link):
 
 
 async def try_send_group_link(update, context):
-    """On /start in a DM, send the person their group's invite link if we can
-    figure out which group they're in. Returns True if a link was sent."""
+    """On /start in a DM: facils get their link now; Year 1s are held until
+    their facil opens the OG. Returns True if we handled the message."""
     chat = update.effective_chat
     if chat is None or chat.type != "private":
         return False
-    og = _og_for(context.args, update.effective_user)
+    role, og = _role_og(context.args, update.effective_user)
     if not og:
         return False
+    uid = update.effective_user.id
+
+    # Year 1s wait for the facil's /add_year_ones (unless the OG is already open)
+    if role == "year1" and not storage.is_og_opened(og):
+        storage.add_waiting(uid, og)
+        await update.effective_message.reply_text(
+            f"You're on the list for {og}! 🌟 Your facil will let you in shortly "
+            "— I'll send your join link the moment they do."
+        )
+        return True
+
     link = await _group_link(context.bot, og)
     if not link:
         return False
     await update.effective_message.reply_text(_welcome(og, link))
-    storage.mark_link_sent(update.effective_user.id, og)
+    storage.mark_link_sent(uid, og)
+    storage.remove_waiting(uid)
     return True
 
 
@@ -124,22 +141,22 @@ async def add_year_ones(update, context):
         )
         return
 
-    # DM the link to this OG's Year 1s who've started the bot (skip already-sent)
-    want = {u for u, g in _year1_og_map().items() if g == og}
+    storage.open_og(og)  # from now on, Year 1s who /start get the link immediately
+
+    # release everyone who was waiting for this OG
     sent = 0
-    for su in storage.get_started():
-        uname = (su.get("username") or "").lower()
-        if uname in want and storage.link_sent_to(su["user_id"]) != og:
-            try:
-                await context.bot.send_message(su["user_id"], _welcome(og, link))
-                storage.mark_link_sent(su["user_id"], og)
-                sent += 1
-            except Exception as exc:
-                log.warning("couldn't DM %s: %s", su["user_id"], exc)
+    for uid in storage.waiting_for_og(og):
+        try:
+            await context.bot.send_message(uid, _welcome(og, link))
+            storage.mark_link_sent(uid, og)
+            storage.remove_waiting(uid)
+            sent += 1
+        except Exception as exc:
+            log.warning("couldn't DM %s: %s", uid, exc)
 
     await update.effective_message.reply_text(
-        f"Sent the {og} join link to {sent} Year 1(s) who've started the bot. "
-        "Anyone who hasn't can message me (or use their emailed link) to get theirs. 🌟"
+        f"Opened {og} — sent the join link to {sent} Year 1(s) who were waiting. "
+        "Anyone who messages me now gets theirs immediately. 🌟"
     )
 
 
