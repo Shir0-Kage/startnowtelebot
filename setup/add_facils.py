@@ -224,6 +224,9 @@ async def _dm_invite(client, r, groups):
         )
         print(f"  DM'd invite link to @{r['handle']} ({r['name']})")
         return "invited"
+    except PeerFloodError:
+        # messaging non-contacts is rate-limited too (Premium doesn't lift this)
+        return "dm_flood"
     except Exception as exc:
         print(f"  couldn't DM @{r['handle']} ({exc})")
         return "unreachable"
@@ -243,8 +246,8 @@ async def _commit(rows, group_delay, only, client=None):
     print(f"{len(matched)} facil(s) across {len(by_group)} group(s); "
           f"{group_delay}s between groups.")
 
-    n_added, n_invited, bad, unreachable = 0, 0, set(), []
-    consecutive, add_stopped = 0, False
+    n_added, n_invited, bad, needs_link = 0, 0, set(), []
+    consecutive, add_stopped, dm_stopped = 0, False, False
     own_client = client is None
     if own_client:
         client = await start_client()
@@ -274,13 +277,23 @@ async def _commit(rows, group_delay, only, client=None):
                     continue
                 if status in ("skipped", "no_group"):
                     continue
-                # cant_add / flood / floodwait / error -> send an invite link instead
-                if await _dm_invite(client, r, groups) == "invited":
+
+                # needs an invite link
+                who = f"{r['name']} ({r['group']}) @{r['handle']}"
+                if dm_stopped:
+                    needs_link.append(who)  # no API call — just list it
+                    continue
+                result = await _dm_invite(client, r, groups)
+                if result == "invited":
                     n_invited += 1
                 else:
-                    unreachable.append(f"{r['name']} ({r['group']}) @{r['handle']}")
+                    needs_link.append(who)
+                    if result == "dm_flood":
+                        dm_stopped = True
+                        print("  DMing is being rate-limited — stopping DMs to "
+                              "protect the account; the rest are just listed below.")
                 await asyncio.sleep(THROTTLE)
-            if not add_stopped and i < len(by_group) - 1:
+            if not (add_stopped and dm_stopped) and i < len(by_group) - 1:
                 print(f"   waiting {group_delay}s before the next group…")
                 await asyncio.sleep(group_delay)
     finally:
@@ -290,12 +303,13 @@ async def _commit(rows, group_delay, only, client=None):
     print(f"\nadded {n_added} directly; DM'd invite links to {n_invited}.")
     if bad:
         print(f"{len(bad)} handle(s) don't resolve — setup.find_handles can suggest fixes.")
-    if unreachable:
-        print(f"\n{len(unreachable)} couldn't be reached (add blocked AND DM failed):")
-        for u in unreachable[:60]:
+    if needs_link:
+        print(f"\n{len(needs_link)} facil(s) still need their invite link (can't be "
+              "added, and DMing is rate-limited/blocked). Post the links where they "
+              "already are (e.g. the facil group):")
+        for u in needs_link[:60]:
             print("  -", u)
-        print("  post their group's link in a shared group instead "
-              "(python -m setup.invite_links).")
+        print("\n  python -m setup.invite_links   # prints each group's link to post")
     if n_invited:
         print("\nOnce the invited facils have joined: "
               "python -m setup.add_facils --promote")
