@@ -1,18 +1,16 @@
-"""Bot-side onboarding: DM people their group's invite link.
+"""Bot-side onboarding: tell people their group and DM their join link.
 
-The bot can't add anyone to a group, but it CAN message users who've messaged
-it — so on /start it sends the person their group's join link (one tap to join).
-Their group comes from a deep-link payload (t.me/<bot>?start=AM3) or, failing
-that, from matching their @username against the Year 1 sheet.
-
-/add_year_ones lets a facil DM the link to all of their group's Year 1s who've
-already started the bot.
+The bot can't add anyone, but it CAN message users who message it. On /start it
+identifies the person and either sends their group's join link or — for Year 1s
+before their facil opens the OG — puts them on a waiting list. It figures out
+their group from a facil deep link (facil-<OG>), their @username, or, if the
+handle doesn't match, the sign-up email they type in.
 """
 
 import logging
 import re
 
-from telegram.ext import CommandHandler
+from telegram.ext import CommandHandler, MessageHandler, filters
 
 import storage
 from setup import manifest, sheets
@@ -20,12 +18,12 @@ from utils.auth import facil_only
 
 log = logging.getLogger(__name__)
 
-_OG_RE = re.compile(r"(?i)\b(AM|PM)\s*(10|[1-9])\b")           # inside a title
-# deep-link payload: 'AM3' (Year 1, held) or 'facil-AM3' (facil, immediate)
-_PAYLOAD_RE = re.compile(r"(?i)^(facil-)?(AM|PM)(10|[1-9])$")
+_OG_RE = re.compile(r"(?i)\b(AM|PM)\s*(10|[1-9])\b")            # inside a title
+_PAYLOAD_RE = re.compile(r"(?i)^(facil-)?(AM|PM)(10|[1-9])$")   # deep-link payload
 
-_year1_map = None    # username (lower) -> OG, built from the sheet on first use
-_link_cache = {}     # OG -> invite link
+_year1_by_handle = None   # username (lower) -> OG
+_year1_by_email = None    # email (lower)    -> OG
+_link_cache = {}          # OG -> invite link
 
 
 def _og_from_title(title):
@@ -35,34 +33,30 @@ def _og_from_title(title):
     return (m.group(1).upper() + m.group(2)) if m else None
 
 
-def _year1_og_map():
-    global _year1_map
-    if _year1_map is None:
-        _year1_map = {}
-        try:
-            for og, members in sheets.load_year1_members().items():
-                for m in members:
-                    if m.get("handle"):
-                        _year1_map[m["handle"].lower()] = og
-        except Exception as exc:
-            log.warning("couldn't load Year 1 roster: %s", exc)
-    return _year1_map
+def _load_year1_maps():
+    global _year1_by_handle, _year1_by_email
+    if _year1_by_handle is not None:
+        return
+    _year1_by_handle, _year1_by_email = {}, {}
+    try:
+        for og, members in sheets.load_year1_members().items():
+            for m in members:
+                if m.get("handle"):
+                    _year1_by_handle[m["handle"].lower()] = og
+                if m.get("email"):
+                    _year1_by_email[m["email"].strip().lower()] = og
+    except Exception as exc:
+        log.warning("couldn't load Year 1 roster: %s", exc)
 
 
-def _role_og(args, user):
-    """(role, OG) from a deep-link payload or @username match. role is 'facil'
-    (get the link now) or 'year1' (held until the OG is opened). (None, None)
-    if we can't tell."""
-    if args:
-        m = _PAYLOAD_RE.match(args[0].strip())
-        if m:
-            role = "facil" if m.group(1) else "year1"
-            return role, (m.group(2).upper() + m.group(3))
-    if user and user.username:
-        og = _year1_og_map().get(user.username.lower())
-        if og:
-            return "year1", og
-    return None, None
+def _og_by_handle(username):
+    _load_year1_maps()
+    return _year1_by_handle.get((username or "").lower())
+
+
+def _og_by_email(email):
+    _load_year1_maps()
+    return _year1_by_email.get((email or "").strip().lower())
 
 
 async def _group_link(bot, og):
@@ -71,7 +65,7 @@ async def _group_link(bot, og):
     entry = manifest.load().get(f"StartNOW! {og}")
     if not entry or not entry.get("chat_id"):
         return None
-    link = entry.get("invite_link")  # reuse one made by setup.invite_links
+    link = entry.get("invite_link")
     if not link:
         try:
             link = (await bot.create_chat_invite_link(entry["chat_id"])).invite_link
@@ -82,41 +76,82 @@ async def _group_link(bot, og):
     return link
 
 
-def _welcome(og, link):
-    return (
-        f"Welcome to StartNOW! 2026 🌟\n\n"
-        f"Here's your orientation group ({og}) — tap to join:\n{link}\n\n"
-        "See you there! ❤️"
-    )
+def _joined(og, link):
+    return f"You're in orientation group {og}! 🌟\n\nTap to join:\n{link}"
+
+
+async def _deliver(update, context, og):
+    """Tell a Year 1 their group, then send the link or hold them until their
+    facil opens the OG."""
+    uid = update.effective_user.id
+    if not storage.is_og_opened(og):
+        storage.add_waiting(uid, og)
+        await update.effective_message.reply_text(
+            f"You're in orientation group {og}! 🌟\n\nYou're on the list — your "
+            "facil will let you in shortly, and I'll send your join link the "
+            "moment they do."
+        )
+        return
+    link = await _group_link(context.bot, og)
+    if not link:
+        await update.effective_message.reply_text(
+            f"You're in orientation group {og}! Your facil will share the join "
+            "link shortly. 🌟"
+        )
+        return
+    await update.effective_message.reply_text(_joined(og, link))
+    storage.mark_link_sent(uid, og)
+    storage.remove_waiting(uid)
 
 
 async def try_send_group_link(update, context):
-    """On /start in a DM: facils get their link now; Year 1s are held until
-    their facil opens the OG. Returns True if we handled the message."""
+    """Handle /start in a DM. Returns True if we handled it."""
     chat = update.effective_chat
     if chat is None or chat.type != "private":
         return False
-    role, og = _role_og(context.args, update.effective_user)
-    if not og:
-        return False
-    uid = update.effective_user.id
 
-    # Year 1s wait for the facil's /add_year_ones (unless the OG is already open)
-    if role == "year1" and not storage.is_og_opened(og):
-        storage.add_waiting(uid, og)
-        await update.effective_message.reply_text(
-            f"You're on the list for {og}! 🌟 Your facil will let you in shortly "
-            "— I'll send your join link the moment they do."
-        )
+    # facil deep link (facil-<OG>) -> their link right away
+    if context.args:
+        m = _PAYLOAD_RE.match(context.args[0].strip())
+        if m and m.group(1):
+            og = m.group(2).upper() + m.group(3)
+            link = await _group_link(context.bot, og)
+            if link:
+                await update.effective_message.reply_text(
+                    f"Welcome, facil! Here's your {og} group — tap to join:\n{link}"
+                )
+                storage.mark_link_sent(update.effective_user.id, og)
+            return True
+
+    # Year 1 matched by @username
+    og = _og_by_handle(update.effective_user.username)
+    if og:
+        await _deliver(update, context, og)
         return True
 
-    link = await _group_link(context.bot, og)
-    if not link:
-        return False
-    await update.effective_message.reply_text(_welcome(og, link))
-    storage.mark_link_sent(uid, og)
-    storage.remove_waiting(uid)
+    # couldn't match the handle -> ask for the sign-up email
+    context.user_data["awaiting_email"] = True
+    await update.effective_message.reply_text(
+        "Welcome to StartNOW! 2026 🌟\n\nI couldn't find you by your Telegram "
+        "handle. Please reply with the email you used to sign up, and I'll find "
+        "your group."
+    )
     return True
+
+
+async def on_text(update, context):
+    """A plain DM — used to collect the sign-up email once we've asked for it."""
+    if not context.user_data.get("awaiting_email"):
+        return
+    og = _og_by_email(update.effective_message.text)
+    if not og:
+        await update.effective_message.reply_text(
+            "Hmm, I couldn't find that email in our sign-up list 😕\n\nPlease "
+            "double-check and reply with the exact email you registered with."
+        )
+        return  # keep waiting for a valid one
+    context.user_data["awaiting_email"] = False
+    await _deliver(update, context, og)
 
 
 @facil_only
@@ -143,11 +178,10 @@ async def add_year_ones(update, context):
 
     storage.open_og(og)  # from now on, Year 1s who /start get the link immediately
 
-    # release everyone who was waiting for this OG
     sent = 0
     for uid in storage.waiting_for_og(og):
         try:
-            await context.bot.send_message(uid, _welcome(og, link))
+            await context.bot.send_message(uid, _joined(og, link))
             storage.mark_link_sent(uid, og)
             storage.remove_waiting(uid)
             sent += 1
@@ -162,3 +196,5 @@ async def add_year_ones(update, context):
 
 def register(app):
     app.add_handler(CommandHandler("add_year_ones", add_year_ones))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
