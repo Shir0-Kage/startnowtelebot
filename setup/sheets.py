@@ -176,3 +176,71 @@ def load_facil_handles(fetch=fetch_csv):
     for gid in FACIL_HANDLE_TABS:
         out.extend(parse_facil_handles(fetch(FACIL_HANDLE_SHEET_ID, gid)))
     return out
+
+
+# --- Facil roster (group assignments joined to handles) ------------------
+
+# Group assignments and handles live in two sheets that only share names, so we
+# fuzzy-join them. These are the ones the join can't resolve on its own — facils
+# missing from the assessment sheet, or names too ambiguous to pick. Filled in
+# by hand; keyed by the facil's name exactly as it appears in the grouping tab.
+FACIL_HANDLE_OVERRIDES = {
+    "Ma Anqi": "aqueous27",
+    "Jian YiXuan": "yeet_suan",
+    "Lau Yi Xuan": "itisyixuan",
+    "Kong Jing Yee": "jingyeeeeeeee",
+    "Mihikaa Singh": "mihikaasingh",
+    "Jedd Lawrence": "harurot",              # @haruot was wrong
+    "Yap Jia Hui, Selin": "veggiemuncher1234",
+    "Koh Luck Heng": "lhislucky",            # @luckheng_koh didn't resolve
+    "Shaquilla Kylie Kasuman": "shaquillak07",
+    "Lee Yan Hui": "brunostedbrod",          # was @bruonstedbrod (typo)
+}
+
+_FACIL_OVERRIDES = {" ".join(k.split()).lower(): v
+                    for k, v in FACIL_HANDLE_OVERRIDES.items()}
+
+
+def match_facils(facils, handles):
+    """Join facils (name+group) to handle rows (name+handle) by fuzzy name.
+    Returns a row per facil with a status ('matched', 'ambiguous', ...)."""
+    rows = []
+    for f in facils:
+        override = _FACIL_OVERRIDES.get(" ".join(f["name"].split()).lower())
+        if override:
+            rows.append({"name": f["name"], "group": f["group"],
+                         "house": f["house"], "handle": override,
+                         "status": "matched"})
+            continue
+        ftok = name_tokens(f["name"])
+        cands = {}
+        for h in handles:
+            htok = name_tokens(h["name"])
+            if htok and (ftok == htok or htok <= ftok or ftok <= htok):
+                cands[h.get("handle") or h["raw_handle"]] = h
+
+        if len(cands) == 1:
+            h = next(iter(cands.values()))
+            status = "matched" if h.get("handle") else "handle_invalid"
+            handle = h.get("handle") or h["raw_handle"]
+        elif len(cands) > 1:
+            status, handle = "ambiguous", " | ".join(sorted(cands))
+        else:
+            status, handle = "no_handle", ""
+
+        rows.append({"name": f["name"], "group": f["group"],
+                     "house": f["house"], "handle": handle, "status": status})
+    return rows
+
+
+def load_facil_members(fetch=fetch_csv):
+    """{OG: [{name, handle}]} for every facil confidently matched to a valid
+    handle. The bot uses this to recognise a facil by their @username on /start."""
+    facils = parse_facil_groups(fetch(FACIL_GROUP_SHEET_ID, FACIL_GROUP_TAB))
+    handles = load_facil_handles(fetch)
+    members = {}
+    for r in match_facils(facils, handles):
+        if r["status"] == "matched" and r["handle"]:
+            members.setdefault(r["group"], []).append(
+                {"name": r["name"], "handle": r["handle"]})
+    return members

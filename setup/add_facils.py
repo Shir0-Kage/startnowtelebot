@@ -55,57 +55,10 @@ FACIL_RIGHTS = ChatAdminRights(
 )
 
 
-# Handles the name-join can't resolve on its own — people missing from the
-# assessment sheet, or names too ambiguous to pick. Filled in by hand; keyed by
-# the facil's name exactly as it appears in the grouping tab.
-HANDLE_OVERRIDES = {
-    "Ma Anqi": "aqueous27",
-    "Jian YiXuan": "yeet_suan",
-    "Lau Yi Xuan": "itisyixuan",
-    "Kong Jing Yee": "jingyeeeeeeee",
-    "Mihikaa Singh": "mihikaasingh",
-    "Jedd Lawrence": "harurot",             # @haruot was wrong
-    "Yap Jia Hui, Selin": "veggiemuncher1234",
-    "Koh Luck Heng": "lhislucky",           # @luckheng_koh didn't resolve
-    "Shaquilla Kylie Kasuman": "shaquillak07",
-    "Lee Yan Hui": "brunostedbrod",         # was @bruonstedbrod (typo)
-}
-
-_OVERRIDES = {" ".join(k.split()).lower(): v for k, v in HANDLE_OVERRIDES.items()}
-
-
-def match_facils(facils, handles):
-    """Join facils (name+group) to handle rows (name+handle) by fuzzy name.
-    Returns a row per facil with a status."""
-    rows = []
-    for f in facils:
-        override = _OVERRIDES.get(" ".join(f["name"].split()).lower())
-        if override:
-            rows.append({"name": f["name"], "group": f["group"],
-                         "house": f["house"], "handle": override,
-                         "status": "matched"})
-            continue
-        ftok = sheets.name_tokens(f["name"])
-        cands = {}
-        for h in handles:
-            htok = sheets.name_tokens(h["name"])
-            if htok and (ftok == htok or htok <= ftok or ftok <= htok):
-                cands[h.get("handle") or h["raw_handle"]] = h
-
-        if len(cands) == 1:
-            h = next(iter(cands.values()))
-            status = "matched" if h.get("handle") else "handle_invalid"
-            handle = h.get("handle") or h["raw_handle"]
-        elif len(cands) > 1:
-            status, handle = "ambiguous", " | ".join(sorted(cands))
-        else:
-            status, handle = "no_handle", ""
-
-        rows.append(
-            {"name": f["name"], "group": f["group"], "house": f["house"],
-             "handle": handle, "status": status}
-        )
-    return rows
+# The facil name→handle join (and the hand-filled overrides for the few names
+# it can't resolve) lives in setup.sheets, so the bot can reuse it on /start
+# without importing this Telethon-heavy module. See sheets.match_facils and
+# sheets.FACIL_HANDLE_OVERRIDES.
 
 
 def write_report(rows):
@@ -139,7 +92,7 @@ def build_rows():
         sheets.fetch_csv(sheets.FACIL_GROUP_SHEET_ID, sheets.FACIL_GROUP_TAB)
     )
     handles = sheets.load_facil_handles()
-    return match_facils(facils, handles)
+    return sheets.match_facils(facils, handles)
 
 
 def _og_order(group):

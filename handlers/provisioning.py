@@ -23,6 +23,7 @@ _PAYLOAD_RE = re.compile(r"(?i)^(facil-)?(AM|PM)(10|[1-9])$")   # deep-link payl
 
 _year1_by_handle = None   # username (lower) -> OG
 _year1_by_email = None    # email (lower)    -> OG
+_facil_by_handle = None   # username (lower) -> OG
 _link_cache = {}          # OG -> invite link
 
 
@@ -57,6 +58,25 @@ def _og_by_handle(username):
 def _og_by_email(email):
     _load_year1_maps()
     return _year1_by_email.get((email or "").strip().lower())
+
+
+def _load_facil_map():
+    global _facil_by_handle
+    if _facil_by_handle is not None:
+        return
+    _facil_by_handle = {}
+    try:
+        for og, members in sheets.load_facil_members().items():
+            for m in members:
+                if m.get("handle"):
+                    _facil_by_handle[m["handle"].lower()] = og
+    except Exception as exc:
+        log.warning("couldn't load facil roster: %s", exc)
+
+
+def _og_by_facil_handle(username):
+    _load_facil_map()
+    return _facil_by_handle.get((username or "").lower())
 
 
 async def _group_link(bot, og):
@@ -104,6 +124,21 @@ async def _deliver(update, context, og):
     storage.remove_waiting(uid)
 
 
+async def _send_facil_link(update, context, og):
+    """Facils aren't held like Year 1s — send their group link right away."""
+    link = await _group_link(context.bot, og)
+    if not link:
+        await update.effective_message.reply_text(
+            f"Welcome, facil! Your {og} group isn't quite ready yet — I'll have "
+            "your join link shortly. 🌟"
+        )
+        return
+    await update.effective_message.reply_text(
+        f"Welcome, facil! Here's your {og} group — tap to join:\n{link}"
+    )
+    storage.mark_link_sent(update.effective_user.id, og)
+
+
 async def try_send_group_link(update, context):
     """Handle /start in a DM. Returns True if we handled it."""
     chat = update.effective_chat
@@ -114,14 +149,14 @@ async def try_send_group_link(update, context):
     if context.args:
         m = _PAYLOAD_RE.match(context.args[0].strip())
         if m and m.group(1):
-            og = m.group(2).upper() + m.group(3)
-            link = await _group_link(context.bot, og)
-            if link:
-                await update.effective_message.reply_text(
-                    f"Welcome, facil! Here's your {og} group — tap to join:\n{link}"
-                )
-                storage.mark_link_sent(update.effective_user.id, og)
+            await _send_facil_link(update, context, m.group(2).upper() + m.group(3))
             return True
+
+    # facil matched by @username -> their link right away (facils aren't held)
+    og = _og_by_facil_handle(update.effective_user.username)
+    if og:
+        await _send_facil_link(update, context, og)
+        return True
 
     # Year 1 matched by @username
     og = _og_by_handle(update.effective_user.username)
