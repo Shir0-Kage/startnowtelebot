@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS year_one_added (
     added_at TEXT,
     PRIMARY KEY (chat_id, handle)
 );
+
+-- Who the bot has DM'd their group invite link, so we don't message them twice.
+CREATE TABLE IF NOT EXISTS link_sent (
+    user_id INTEGER PRIMARY KEY,
+    og      TEXT,
+    sent_at TEXT
+);
 """
 
 
@@ -255,6 +262,24 @@ def get_started():
     with _lock:
         rows = _conn.execute("SELECT * FROM started_users").fetchall()
     return [dict(r) for r in rows]
+
+
+def mark_link_sent(user_id, og):
+    with _lock:
+        _conn.execute(
+            "INSERT OR REPLACE INTO link_sent (user_id, og, sent_at) VALUES (?, ?, ?)",
+            (user_id, og, _now_iso()),
+        )
+        _conn.commit()
+
+
+def link_sent_to(user_id):
+    """The OG we've already DM'd this user (or None)."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT og FROM link_sent WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row["og"] if row else None
 
 
 # ---------------------------------------------------------------------------

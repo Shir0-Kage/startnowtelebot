@@ -107,6 +107,7 @@ def parse_year1(text):
                 "handle": handle,
                 "raw_handle": raw,
                 "addable": handle is not None,
+                "email": row[2].strip() if len(row) > 2 else "",
             }
         )
     return groups

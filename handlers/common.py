@@ -3,6 +3,7 @@
 from telegram.ext import CommandHandler
 
 import storage
+from handlers import provisioning
 
 START_TEXT = (
     "👋 Hey there, welcome to <b>StartNOW! 2026</b>!\n\n"
@@ -42,11 +43,14 @@ async def start(update, context):
     chat = update.effective_chat
     if chat:
         storage.ensure_group(chat.id, chat.title or chat.full_name or "")
-    # note who's checked in — the group setup scripts use this to know who's
-    # ready to be added to the orientation groups
+    # note who's checked in — used to DM their group link / for batch sends
     user = update.effective_user
     if user:
         storage.mark_started(user.id, user.username, user.full_name)
+    # if we can tell which group they're in, DM them the join link instead of
+    # the generic welcome
+    if await provisioning.try_send_group_link(update, context):
+        return
     await update.effective_message.reply_html(START_TEXT)
 
 

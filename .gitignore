@@ -16,6 +16,7 @@ setup/facil_match_report.csv
 setup/facil_added.json
 setup/handle_suggestions.csv
 setup/invite_links.csv
+setup/*.csv
 setup/facil_*_state.json
 setup/*_cache.csv
 # local image asset dropped in for set_group_photo.py
