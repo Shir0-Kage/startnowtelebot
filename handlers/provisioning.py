@@ -60,6 +60,15 @@ def _og_by_email(email):
     return _year1_by_email.get((email or "").strip().lower())
 
 
+def _reload_year1_maps():
+    """Drop the cached roster so the next lookup re-reads the sheet — used after
+    new Year 1s are added to the Year 1 sheet mid-programme."""
+    global _year1_by_handle, _year1_by_email
+    _year1_by_handle = None
+    _year1_by_email = None
+    _load_year1_maps()
+
+
 def _load_facil_map():
     global _facil_by_handle
     if _facil_by_handle is not None:
@@ -229,7 +238,45 @@ async def add_year_ones(update, context):
     )
 
 
+@facil_only
+async def sync_year_ones(update, context):
+    """Re-read the roster and onboard anyone who has already /started but isn't
+    placed yet — e.g. Year 1s added to the sheet after the programme began. For
+    an OG that's already been opened we DM their join link now; for one that
+    hasn't, we hold them for their facil. People who never /started the bot can't
+    be reached and are skipped (they'll be onboarded the moment they /start)."""
+    _reload_year1_maps()
+    sent = held = 0
+    for su in storage.get_started():
+        uid = su["user_id"]
+        if storage.link_sent_to(uid):
+            continue  # already has their link
+        og = _og_by_handle(su.get("username"))
+        if not og:
+            continue  # not a Year 1 we can match by @username
+        if storage.is_og_opened(og):
+            link = await _group_link(context.bot, og)
+            if not link:
+                continue
+            try:
+                await context.bot.send_message(uid, _joined(og, link))
+                storage.mark_link_sent(uid, og)
+                storage.remove_waiting(uid)
+                sent += 1
+            except Exception as exc:
+                log.warning("couldn't DM %s: %s", uid, exc)
+        else:
+            storage.add_waiting(uid, og)
+            held += 1
+    await update.effective_message.reply_text(
+        f"Synced from the sheet 🌟\nDM'd {sent} Year 1(s) their join link; "
+        f"holding {held} until their facil opens the group. Anyone who hasn't "
+        "messaged me yet gets theirs the moment they /start."
+    )
+
+
 def register(app):
     app.add_handler(CommandHandler("add_year_ones", add_year_ones))
+    app.add_handler(CommandHandler("sync_year_ones", sync_year_ones))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
