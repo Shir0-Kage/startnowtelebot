@@ -51,3 +51,10 @@ REMINDER_OFFSETS = [
 
 # Reminders are on by default for a new group; facils can toggle per chat.
 REMINDERS_DEFAULT_ON = True
+
+
+# --- Human Bingo OCR matching ----------------------------------------------
+# Minimum WRatio score (0-100) for a fuzzy handle match to be accepted.
+BINGO_MATCH_THRESHOLD = 85
+# A winning match must beat the runner-up by at least this many points.
+BINGO_MATCH_MARGIN = 8
