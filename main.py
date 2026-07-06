@@ -8,7 +8,7 @@ import logging
 import sys
 
 from telegram import BotCommand, Update
-from telegram.ext import Application
+from telegram.ext import Application, Defaults
 
 import config
 import storage
@@ -77,6 +77,10 @@ def main():
     app = (
         Application.builder()
         .token(config.BOT_TOKEN)
+        # If someone deletes their message before our reply lands (common in
+        # groups, where replies quote by default), send it anyway instead of
+        # raising "Message to be replied not found".
+        .defaults(Defaults(allow_sending_without_reply=True))
         .post_init(_on_startup)
         .build()
     )
