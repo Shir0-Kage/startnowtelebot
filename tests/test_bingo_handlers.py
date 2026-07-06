@@ -1,0 +1,326 @@
+"""Tests for handlers/bingo.py — the human-bingo Telegram flow.
+
+Telegram Bot calls and the OCR pipeline are monkeypatched so these run fully
+offline and deterministically. Async handlers are invoked with asyncio.run so
+the suite needs no pytest-asyncio plugin.
+"""
+
+import asyncio
+import importlib
+import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+
+# --- DB-backed storage on a temp file --------------------------------------
+
+@pytest.fixture()
+def store(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "bingo_test.db"))
+    for mod in ("storage",):
+        sys.modules.pop(mod, None)
+    import storage
+    importlib.reload(storage)
+    monkeypatch.setattr(storage, "DB_PATH", str(tmp_path / "bingo_test.db"))
+    storage.init_db()
+    return storage
+
+
+@pytest.fixture()
+def bingo(store, monkeypatch):
+    """handlers.bingo with a fixed 2-OG roster and no network."""
+    import handlers.bingo as bingo
+    importlib.reload(bingo)
+
+    roster = {
+        "AM1": [
+            {"name": "Alice Tan", "handle": "alice", "email": "a@x.com", "addable": True},
+            {"name": "Bob Lee", "handle": "bob", "email": "b@x.com", "addable": True},
+            {"name": "Cara Ng", "handle": "cara", "email": "c@x.com", "addable": True},
+            {"name": "Dan Ong", "handle": "dan", "email": "d@x.com", "addable": True},
+            {"name": "Eve Sim", "handle": "eve", "email": "e@x.com", "addable": True},
+        ],
+    }
+    monkeypatch.setattr(bingo.sheets, "load_year1_members", lambda: roster)
+    bingo._ROSTER_INDEX = None  # reset the module cache
+    return bingo
+
+
+def _update(user_id=100, username="submitter", text="/get_bingo"):
+    msg = MagicMock()
+    msg.reply_text = AsyncMock()
+    msg.reply_html = AsyncMock()
+    msg.reply_photo = AsyncMock()
+    msg.reply_document = AsyncMock()
+    upd = MagicMock()
+    upd.effective_user = SimpleNamespace(id=user_id, username=username, full_name="Sub Mitter")
+    upd.effective_chat = SimpleNamespace(id=user_id, type="private")
+    upd.effective_message = msg
+    return upd
+
+
+def _context():
+    ctx = MagicMock()
+    ctx.bot = AsyncMock()
+    ctx.user_data = {}
+    ctx.job_queue = MagicMock()
+    return ctx
+
+
+# --- helper: matched dict + prompt map from OCR cells ----------------------
+
+def test_matched_and_prompts_drops_non_match_and_self(bingo, monkeypatch):
+    # read_submission already applies the score/margin cutoff, so any non-None
+    # handle here is confident; _matched_and_prompts only drops no-match (None
+    # handle) and the submitter's own handle (no self-cheese). prompts come from
+    # templates.prompt_for(sheet_no, r, c) given an explicit sheet_no.
+    monkeypatch.setattr(
+        bingo.templates, "prompt_for",
+        lambda s, r, c: f"P{r}{c}",
+    )
+    cells = [
+        {"row": 0, "col": 0, "handle": "alice", "score": 91.0},
+        {"row": 0, "col": 2, "handle": None, "score": 0.0},       # no match -> dropped
+        {"row": 0, "col": 3, "handle": "submitter", "score": 99}, # self -> dropped
+        {"row": 0, "col": 4, "handle": "cara", "score": 88.0},
+    ]
+    matched, prompts = bingo._matched_and_prompts(cells, "submitter", sheet_no=1)
+    assert matched == {(0, 0): "alice", (0, 4): "cara"}
+    assert prompts[(0, 0)] == "P00" and prompts[(0, 4)] == "P04"
+    assert (0, 2) not in matched and (0, 3) not in matched
+
+
+# --- helper: per-line verdict ----------------------------------------------
+
+def test_line_verdict_pass_fail_pending(bingo):
+    line = [(0, 0, "alice"), (0, 1, "bob"), (0, 3, "dan"), (0, 4, "eve")]  # 4 real cells
+    # all yes -> pass
+    assert bingo._line_verdict(line, {"alice": "yes", "bob": "yes", "dan": "yes", "eve": "yes"}) == "pass"
+    # one no, rest yes -> still pass (one allowed miss == required_yes met)
+    assert bingo._line_verdict(line, {"alice": "yes", "bob": "yes", "dan": "yes", "eve": "no"}) == "pass"
+    # two misses -> fail
+    assert bingo._line_verdict(line, {"alice": "yes", "bob": "yes", "dan": "no", "eve": "no"}) == "fail"
+    # unanswered cells and not yet failable -> pending
+    assert bingo._line_verdict(line, {"alice": "yes", "bob": "yes"}) == "pending"
+
+
+# --- get_bingo -------------------------------------------------------------
+
+def test_get_bingo_non_roster_declines(bingo):
+    upd, ctx = _update(user_id=999, username="stranger"), _context()
+    asyncio.run(bingo.get_bingo(upd, ctx))
+    upd.effective_message.reply_text.assert_awaited()
+    assert not ctx.bot.send_photo.await_count  # nothing sent
+
+
+def test_get_bingo_roster_sends_sheet_and_freezes(bingo, store):
+    upd, ctx = _update(user_id=100, username="alice"), _context()
+    asyncio.run(bingo.get_bingo(upd, ctx))
+    # existing implementation uses reply_document (not reply_photo)
+    upd.effective_message.reply_document.assert_awaited()
+    first = store.get_bingo_sheet(100)
+    assert first is not None
+    # calling again must not reallocate
+    asyncio.run(bingo.get_bingo(upd, ctx))
+    assert store.get_bingo_sheet(100) == first
+
+
+# --- submit_bingo gating ---------------------------------------------------
+
+def test_submit_bingo_sets_flag_when_open(bingo, store):
+    store.allocate_bingo_sheet(100, "alice")  # must have a card first
+    upd, ctx = _update(user_id=100, username="alice", text="/submit_bingo"), _context()
+    asyncio.run(bingo.submit_bingo(upd, ctx))
+    assert ctx.user_data.get("awaiting_bingo") is True
+    upd.effective_message.reply_text.assert_awaited()
+
+
+def test_submit_bingo_blocked_when_closed(bingo, store):
+    store.set_bingo_closed()
+    upd, ctx = _update(user_id=100, username="alice", text="/submit_bingo"), _context()
+    asyncio.run(bingo.submit_bingo(upd, ctx))
+    assert not ctx.user_data.get("awaiting_bingo")
+
+
+def test_submit_bingo_blocked_when_already_won(bingo, store, monkeypatch):
+    monkeypatch.setattr(store, "has_bingo_prize", lambda uid: True)
+    upd, ctx = _update(user_id=100, username="alice", text="/submit_bingo"), _context()
+    asyncio.run(bingo.submit_bingo(upd, ctx))
+    assert not ctx.user_data.get("awaiting_bingo")
+
+
+# --- on_bingo_image full pipeline -> pending + DMs subjects -----------------
+
+def _photo_update(user_id=100, username="alice"):
+    upd = _update(user_id=user_id, username=username)
+    photo = SimpleNamespace(file_id="F")
+    upd.effective_message.photo = [photo]
+    upd.effective_message.document = None
+    return upd
+
+
+def test_on_bingo_image_records_line_and_dms_subjects(bingo, store, monkeypatch):
+    # allocate sheet 1 for the submitter (id 100)
+    store.allocate_bingo_sheet(100, "alice")
+    sheet = store.get_bingo_sheet(100)
+    # register subjects so they're reachable
+    for uid, h in [(1, "bob"), (2, "cara"), (3, "dan"), (4, "eve")]:
+        store.mark_started(uid, h, h.title())
+
+    # OCR returns a full top-row line of 4 distinct, non-self, confident handles
+    def fake_read(sheet_no, image_bytes, index):
+        return {"corner": sheet_no, "cells": [
+            {"row": 0, "col": 0, "handle": "bob", "score": 95.0},
+            {"row": 0, "col": 1, "handle": "cara", "score": 95.0},
+            {"row": 0, "col": 3, "handle": "dan", "score": 95.0},
+            {"row": 0, "col": 4, "handle": "eve", "score": 95.0},
+        ]}
+    monkeypatch.setattr(bingo.ocr, "read_submission", fake_read)
+    monkeypatch.setattr(bingo.templates, "prompt_for", lambda s, r, c: f"prompt-{r}-{c}")
+    # winning_lines: top row (row 0) complete (centre free auto-fills col 2)
+    monkeypatch.setattr(bingo.lines, "winning_lines",
+                        lambda matched, sub: [[(0, 0, "bob"), (0, 1, "cara"), (0, 3, "dan"), (0, 4, "eve")]])
+
+    ctx = _context()
+    ctx.user_data["awaiting_bingo"] = True
+    # bot.get_file -> file whose download_as_bytearray returns image bytes
+    tg_file = AsyncMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"img"))
+    ctx.bot.get_file = AsyncMock(return_value=tg_file)
+
+    upd = _photo_update(100, "alice")
+    asyncio.run(bingo.on_bingo_image(upd, ctx))
+
+    sub = store.active_submission(100)
+    assert sub is not None and sub["status"] == "pending"
+    members = store.winning_members(sub["id"])
+    assert {m["handle"] for m in members} == {"bob", "cara", "dan", "eve"}
+    # each reachable subject was DM'd a Yes/No keyboard
+    assert ctx.bot.send_message.await_count == 4
+    # a 12h timeout job was armed
+    ctx.job_queue.run_once.assert_called_once()
+    assert ctx.user_data.get("awaiting_bingo") is not True
+
+
+def test_on_bingo_image_no_line_reports_and_cooldowns(bingo, store, monkeypatch):
+    store.allocate_bingo_sheet(100, "alice")
+    monkeypatch.setattr(bingo.ocr, "read_submission",
+                        lambda s, b, i: {"corner": s, "cells": []})
+    monkeypatch.setattr(bingo.lines, "winning_lines", lambda matched, sub: [])
+    ctx = _context()
+    ctx.user_data["awaiting_bingo"] = True
+    tg_file = AsyncMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"img"))
+    ctx.bot.get_file = AsyncMock(return_value=tg_file)
+    upd = _photo_update(100, "alice")
+    asyncio.run(bingo.on_bingo_image(upd, ctx))
+    assert store.active_submission(100) is None  # nothing pending
+    upd.effective_message.reply_text.assert_awaited()
+
+
+# --- confirm_button -> pass -> claim + announce + DM ------------------------
+
+def test_confirm_button_pass_awards_and_posts(bingo, store, monkeypatch):
+    store.allocate_bingo_sheet(100, "alice")
+    sub_id = store.start_bingo_submission(100, "alice", store.get_bingo_sheet(100), 1)
+    line_members = [
+        {"row": 0, "col": 0, "handle": "bob", "prompt": "p0", "target_user_id": 1},
+        {"row": 0, "col": 1, "handle": "cara", "prompt": "p1", "target_user_id": 2},
+        {"row": 0, "col": 3, "handle": "dan", "prompt": "p3", "target_user_id": 3},
+        {"row": 0, "col": 4, "handle": "eve", "prompt": "p4", "target_user_id": 4},
+    ]
+    store.record_winning_members(sub_id, line_members)
+
+    ctx = _context()
+
+    def tap(uid, row, col, ans):
+        q = AsyncMock()
+        q.data = f"bingoconf:{sub_id}:{row}:{col}:{ans}"
+        q.answer = AsyncMock()
+        q.edit_message_reply_markup = AsyncMock()
+        q.from_user = SimpleNamespace(id=uid)
+        upd = MagicMock()
+        upd.callback_query = q
+        upd.effective_user = SimpleNamespace(id=uid)
+        asyncio.run(bingo.confirm_button(upd, ctx))
+
+    tap(1, 0, 0, "yes")
+    tap(2, 0, 1, "yes")
+    tap(3, 0, 3, "yes")
+    # 3 of 4 yes votes already satisfies required_yes (4-1=3), so prize claimed
+    # after the 3rd tap. The 4th is a no-op (already verified).
+    tap(4, 0, 4, "yes")  # redundant tap; submission already resolved
+
+    assert store.has_bingo_prize(100) is True
+    assert store.bingo_prizes_claimed() == 1
+    # channel post to ANNOUNCE_CHAT_ID happened
+    import config
+    posted = [c for c in ctx.bot.send_message.await_args_list
+              if c.kwargs.get("chat_id") == config.ANNOUNCE_CHAT_ID]
+    assert posted, "expected a channel announcement"
+    sub = store.active_submission(100)
+    assert sub is None  # no longer pending (verified)
+
+
+def test_confirm_button_caches_answer_game_wide(bingo, store):
+    store.allocate_bingo_sheet(100, "alice")
+    sub_id = store.start_bingo_submission(100, "alice", store.get_bingo_sheet(100), 1)
+    store.record_winning_members(sub_id, [
+        {"row": 0, "col": 0, "handle": "bob", "prompt": "likes cats", "target_user_id": 1},
+    ])
+    ctx = _context()
+    q = AsyncMock()
+    q.data = f"bingoconf:{sub_id}:0:0:yes"
+    q.answer = AsyncMock()
+    q.edit_message_reply_markup = AsyncMock()
+    q.from_user = SimpleNamespace(id=1)
+    upd = MagicMock()
+    upd.callback_query = q
+    upd.effective_user = SimpleNamespace(id=1)
+    asyncio.run(bingo.confirm_button(upd, ctx))
+    assert store.get_cached_confirmation(1, "likes cats") == "yes"
+
+
+# --- closing the game cancels outstanding timeout jobs ---------------------
+
+def test_award_at_limit_cancels_outstanding_timeouts(bingo, store, monkeypatch):
+    # Fill 9 prizes so the next claim is the 10th and closes the game.
+    # Mark those submissions verified so they don't appear in pending_submissions()
+    # (otherwise _cancel_outstanding_timeouts would try to cancel their jobs too).
+    for uid in range(200, 209):
+        s = store.start_bingo_submission(uid, f"w{uid}", 1, None)
+        store.claim_bingo_prize(uid, f"w{uid}", s)
+        store.set_submission_status(s, "verified", verified_at=store._now_iso())
+    assert store.bingo_prizes_claimed() == 9
+
+    store.allocate_bingo_sheet(100, "alice")
+    sub_id = store.start_bingo_submission(100, "alice", store.get_bingo_sheet(100), 1)
+    store.record_winning_members(sub_id, [
+        {"row": 0, "col": 0, "handle": "bob", "prompt": "p0", "target_user_id": 1},
+        {"row": 0, "col": 1, "handle": "cara", "prompt": "p1", "target_user_id": 2},
+        {"row": 0, "col": 3, "handle": "dan", "prompt": "p3", "target_user_id": 3},
+        {"row": 0, "col": 4, "handle": "eve", "prompt": "p4", "target_user_id": 4},
+    ])
+    for uid, prompt in [(1, "p0"), (2, "p1"), (3, "p3"), (4, "p4")]:
+        store.record_bingo_confirmation(uid, prompt, "yes")
+
+    ctx = _context()
+    # one outstanding timeout job the close should cancel
+    job = MagicMock()
+    ctx.job_queue.get_jobs_by_name = MagicMock(return_value=[job])
+
+    asyncio.run(bingo._finalize(ctx, sub_id))
+
+    assert store.bingo_is_closed() is True
+    job.schedule_removal.assert_called_once()
+
+
+# --- register wires the four handlers --------------------------------------
+
+def test_register_adds_handlers(bingo):
+    app = MagicMock()
+    bingo.register(app)
+    assert app.add_handler.call_count >= 4
