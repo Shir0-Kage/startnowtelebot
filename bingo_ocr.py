@@ -17,7 +17,7 @@ import io
 import logging
 import re
 
-from PIL import Image, ImageOps, ImageStat
+from PIL import Image, ImageOps
 
 from config import BINGO_MATCH_MARGIN, BINGO_MATCH_THRESHOLD
 from data import bingo_templates as bt
@@ -53,20 +53,6 @@ def _encode(pil_img):
     buf = io.BytesIO()
     pil_img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()
-
-
-def _ocr_text(eng, image):
-    """Run *eng* (a RapidOCR-compatible callable) on a PIL image.
-
-    Returns the concatenated text (may be '').  The caller obtains *eng* once
-    via _engine() so we share the stateful singleton across the crops in a
-    single submission; tests monkeypatch _engine() with a scripted fake.
-    """
-    result, _elapse = eng(_encode(image))
-    if not result:
-        return ""
-    # result is a list of [box, text, confidence]; join text fragments.
-    return " ".join(str(line[1]) for line in result if len(line) > 1 and line[1])
 
 
 # --- Handle normalisation (looser than setup.sheets.normalize_handle) ------
@@ -278,14 +264,10 @@ def match_handle(text, index):
 
 
 # --- Image helpers ---------------------------------------------------------
-_REF_WIDTH = 1000       # normalize a corner crop's source to this width
 _DETECT_WIDTH = 1600    # normalize the whole sheet to this width for the OCR pass
-_INSET = 0.08           # trim 8% off each side of a cell to drop prompt/gridlines
-_UPSCALE = 3            # LANCZOS upscaling factor for the cropped cell
-_DARK_MEAN = 110        # crops darker than this get inverted to dark-on-light
 
 
-def _load_image(image_bytes, ref_width=_REF_WIDTH):
+def _load_image(image_bytes, ref_width=_DETECT_WIDTH):
     im = Image.open(io.BytesIO(image_bytes))
     im = ImageOps.exif_transpose(im)          # fix phone rotation
     im = im.convert("RGB")
@@ -294,33 +276,6 @@ def _load_image(image_bytes, ref_width=_REF_WIDTH):
         scale = ref_width / w
         im = im.resize((ref_width, max(1, int(h * scale))), Image.LANCZOS)
     return im
-
-
-def _crop_box(im, frac):
-    """Crop a fractional (x0,y0,x1,y1) box with an inward inset, upscaled."""
-    w, h = im.size
-    x0, y0, x1, y1 = frac
-    bw, bh = (x1 - x0), (y1 - y0)
-    x0 += bw * _INSET
-    x1 -= bw * _INSET
-    y0 += bh * _INSET
-    y1 -= bh * _INSET
-    box = (int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h))
-    crop = im.crop(box)
-    if crop.width and crop.height:
-        crop = crop.resize(
-            (crop.width * _UPSCALE, crop.height * _UPSCALE), Image.LANCZOS
-        )
-    return crop
-
-
-def _prep_for_ocr(crop):
-    """Grayscale, contrast-boost, invert-if-dark. Returns a PIL image."""
-    g = ImageOps.grayscale(crop)
-    g = ImageOps.autocontrast(g)
-    if ImageStat.Stat(g).mean[0] < _DARK_MEAN:
-        g = ImageOps.invert(g)
-    return g.convert("RGB")
 
 
 # --- Nearest-box attribution ----------------------------------------------
@@ -383,21 +338,22 @@ def read_submission(sheet_no, image_bytes, index):
     """OCR one filled sheet and attribute each handle to its NEAREST cell.
 
     Returns:
-        {"corner": int|None,
-         "cells": [{"row":int,"col":int,"handle":str|None,"score":float}, ...]}
-    with exactly 24 cell dicts (the FREE centre is skipped).
+        {"cells": [{"row":int,"col":int,"handle":str|None,"score":float}, ...]}
+    with exactly 24 cell dicts (the FREE centre is skipped). sheet_no is accepted
+    for API symmetry but unused: the printed sheet number is a decorative pixel-
+    outline font OCR can't read, so the wrong-sheet check was dropped in favour of
+    the per-person confirmation flow.
 
     The whole sheet is OCR'd in a single pass; each detected text box is fuzzy-
     matched to the roster and, if it's a confident handle, assigned to the cell
     whose centre it sits nearest (when two land on one cell, the higher score
     wins). This tolerates handles that overhang a cell edge or float in the
-    gutter, which a fixed per-cell crop could not. The sheet number is read from
-    its own small, reliable corner crop.
+    gutter, which a fixed per-cell crop could not.
 
     The OCR engine is obtained once per call so a monkeypatched _engine() that
-    returns a scripted fake stays in sync across the sheet pass and corner crop.
+    returns a scripted fake stays in sync.
     """
-    im = _load_image(image_bytes, _DETECT_WIDTH)
+    im = _load_image(image_bytes)
     eng = _engine()     # acquire once; tests replace this with a scripted fake
 
     centres = _cell_centres()
@@ -415,16 +371,6 @@ def read_submission(sheet_no, image_bytes, index):
         if rc is not None and score > cells[rc]["score"]:
             cells[rc]["handle"], cells[rc]["score"] = handle, score
 
-    corner_text = _ocr_text(eng, _prep_for_ocr(_crop_box(im, bt.CORNER_BOX)))
-    corner = _read_int(corner_text)
-
-    ordered = [cells[(r, c)]
-               for r in range(bt.GRID) for c in range(bt.GRID)
-               if not bt.is_free(r, c)]
-    return {"corner": corner, "cells": ordered}
-
-
-def _read_int(text):
-    """First run of digits in the OCR text as an int, else None."""
-    m = re.search(r"\d+", text or "")
-    return int(m.group()) if m else None
+    return {"cells": [cells[(r, c)]
+                      for r in range(bt.GRID) for c in range(bt.GRID)
+                      if not bt.is_free(r, c)]}

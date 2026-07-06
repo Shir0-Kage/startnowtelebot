@@ -559,8 +559,13 @@ def last_bingo_activity(user_id):
     return row["submitted_at"] if row else None
 
 
-def start_bingo_submission(user_id, handle, sheet_no, corner_read):
-    """Open a new pending submission and return its id."""
+def start_bingo_submission(user_id, handle, sheet_no, corner_read=None):
+    """Open a new pending submission and return its id.
+
+    corner_read is retained for backwards compatibility / audit but is always
+    NULL now — the wrong-sheet check was dropped (the printed sheet number is an
+    OCR-unreadable pixel font), so verification leans on per-person confirmation.
+    """
     with _lock:
         cur = _conn.execute(
             "INSERT INTO bingo_submissions "

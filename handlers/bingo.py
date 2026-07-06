@@ -6,7 +6,7 @@ winning-line detection and confirmations) is added on top of this module later.
 
 The full flow: gate on bingo_is_closed / has_bingo_prize / active_submission +
 cooldown; two-step image upload (context.user_data["awaiting_bingo"]); OCR via
-bingo_ocr.read_submission; corner-number wrong-sheet reject; winning_lines ->
+bingo_ocr.read_submission; winning_lines ->
 pick_best_line; record submission + winning_members; DM each reachable,
 non-self, non-cached subject a Yes/No inline keyboard, reusing cached
 confirmations, and arm a config.BINGO_CONFIRM_TIMEOUT job; confirm_button
@@ -279,19 +279,6 @@ async def on_bingo_image(update, context):
         lambda: ocr.read_submission(sheet_no, image_bytes, _roster_index()),
     )
 
-    # wrong-sheet defence: a confident, mismatched corner number rejects
-    corner = read.get("corner")
-    if corner is not None and corner != sheet_no:
-        # Record the attempt (so the retry cooldown still applies) but resolve it
-        # immediately — leaving it 'pending' would block the user's next submit.
-        rejected = storage.start_bingo_submission(uid, handle, sheet_no, corner)
-        storage.set_submission_status(rejected, "rejected")
-        await update.effective_message.reply_text(
-            f"This looks like sheet #{corner}, but you were given sheet "
-            f"#{sheet_no}. Please send your own card 🙂"
-        )
-        return
-
     matched, prompts = _matched_and_prompts(read.get("cells", []), handle, sheet_no)
 
     candidate_lines = lines.winning_lines(matched, handle)
@@ -303,7 +290,7 @@ async def on_bingo_image(update, context):
         return
 
     line = lines.pick_best_line(candidate_lines)
-    submission_id = storage.start_bingo_submission(uid, handle, sheet_no, corner)
+    submission_id = storage.start_bingo_submission(uid, handle, sheet_no)
 
     members = []
     for (r, c, h) in line:

@@ -140,33 +140,23 @@ def _cell_centre_frac(rc):
 
 
 class _FakeEngine:
-    """Mimics rapidocr_onnxruntime.RapidOCR.__call__ for the single-pass model.
+    """Mimics rapidocr_onnxruntime.RapidOCR.__call__ for the single-pass model:
+    the whole sheet is OCR'd once, so we return each scripted detection as a
+    [box, text, conf] positioned at a fractional (fx, fy) of the passed image."""
 
-    Call 1 OCRs the whole sheet: we return each scripted detection as a
-    [box, text, conf] positioned at a fractional (fx, fy) of the passed image.
-    Call 2 OCRs the corner crop: we return the scripted sheet-number text.
-    """
-
-    def __init__(self, detections, corner_text=""):
+    def __init__(self, detections):
         self._detections = list(detections)   # (fx, fy, text)
-        self._corner = corner_text
-        self._call = 0
 
     def __call__(self, image, **kwargs):
         # the pipeline hands the engine PNG bytes; decode to size the boxes
-        self._call += 1
-        if self._call == 1:
-            w, h = Image.open(io.BytesIO(image)).size
-            result = []
-            for fx, fy, text in self._detections:
-                px, py = fx * w, fy * h
-                box = [[px - 6, py - 6], [px + 6, py - 6],
-                       [px + 6, py + 6], [px - 6, py + 6]]
-                result.append([box, text, 0.99])
-            return (result or None), 0.0
-        if not self._corner:
-            return None, 0.0
-        return [[[[0, 0], [1, 0], [1, 1], [0, 1]], self._corner, 0.99]], 0.0
+        w, h = Image.open(io.BytesIO(image)).size
+        result = []
+        for fx, fy, text in self._detections:
+            px, py = fx * w, fy * h
+            box = [[px - 6, py - 6], [px + 6, py - 6],
+                   [px + 6, py + 6], [px - 6, py + 6]]
+            result.append([box, text, 0.99])
+        return (result or None), 0.0
 
 
 def test_read_submission_maps_handles_to_nearest_cell(monkeypatch, index):
@@ -185,12 +175,10 @@ def test_read_submission_maps_handles_to_nearest_cell(monkeypatch, index):
         (overhang_x, overhang_y, "@aqueous27"),  # off-centre, snaps to (0,4)
         (0.5, 0.5, "Has a partner"),             # a prompt line -> matches nothing
     ]
-    monkeypatch.setattr(bingo_ocr, "_engine",
-                        lambda: _FakeEngine(detections, corner_text="7"))
+    monkeypatch.setattr(bingo_ocr, "_engine", lambda: _FakeEngine(detections))
 
     out = bingo_ocr.read_submission(7, _blank_png_bytes(), index)
 
-    assert out["corner"] == 7
     assert len(out["cells"]) == 24
     by = {(c["row"], c["col"]): c for c in out["cells"]}
     assert by[(0, 0)]["handle"] == "joshua_lim"
@@ -207,16 +195,14 @@ def test_read_submission_ignores_detections_outside_the_grid(monkeypatch, index)
         (0.5, 0.03, "@joshua_lim"),   # up in the banner
         (0.5, 0.97, "rocket"),        # down in the footer
     ]
-    monkeypatch.setattr(bingo_ocr, "_engine",
-                        lambda: _FakeEngine(detections, corner_text="7"))
+    monkeypatch.setattr(bingo_ocr, "_engine", lambda: _FakeEngine(detections))
     out = bingo_ocr.read_submission(7, _blank_png_bytes(), index)
     assert all(cell["handle"] is None for cell in out["cells"])
 
 
-def test_read_submission_corner_none_when_unreadable(monkeypatch, index):
-    monkeypatch.setattr(bingo_ocr, "_engine",
-                        lambda: _FakeEngine([], corner_text="garble"))
+def test_read_submission_empty_sheet_yields_all_empty_cells(monkeypatch, index):
+    monkeypatch.setattr(bingo_ocr, "_engine", lambda: _FakeEngine([]))
     out = bingo_ocr.read_submission(3, _blank_png_bytes(), index)
-    assert out["corner"] is None
     assert len(out["cells"]) == 24
+    assert all(cell["handle"] is None for cell in out["cells"])
     assert all(cell["handle"] is None for cell in out["cells"])

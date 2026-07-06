@@ -173,7 +173,7 @@ def test_on_bingo_image_records_line_and_dms_subjects(bingo, store, monkeypatch)
 
     # OCR returns a full top-row line of 4 distinct, non-self, confident handles
     def fake_read(sheet_no, image_bytes, index):
-        return {"corner": sheet_no, "cells": [
+        return {"cells": [
             {"row": 0, "col": 0, "handle": "bob", "score": 95.0},
             {"row": 0, "col": 1, "handle": "cara", "score": 95.0},
             {"row": 0, "col": 3, "handle": "dan", "score": 95.0},
@@ -209,7 +209,7 @@ def test_on_bingo_image_records_line_and_dms_subjects(bingo, store, monkeypatch)
 def test_on_bingo_image_no_line_reports_and_cooldowns(bingo, store, monkeypatch):
     store.allocate_bingo_sheet(100, "alice")
     monkeypatch.setattr(bingo.ocr, "read_submission",
-                        lambda s, b, i: {"corner": s, "cells": []})
+                        lambda s, b, i: {"cells": []})
     monkeypatch.setattr(bingo.lines, "winning_lines", lambda matched, sub: [])
     ctx = _context()
     ctx.user_data["awaiting_bingo"] = True
@@ -220,25 +220,6 @@ def test_on_bingo_image_no_line_reports_and_cooldowns(bingo, store, monkeypatch)
     asyncio.run(bingo.on_bingo_image(upd, ctx))
     assert store.active_submission(100) is None  # nothing pending
     upd.effective_message.reply_text.assert_awaited()
-
-
-def test_on_bingo_image_wrong_sheet_does_not_strand_pending(bingo, store, monkeypatch):
-    # A mismatched corner number must be REJECTED without leaving a 'pending'
-    # row (which would lock the user out of /submit_bingo forever).
-    store.allocate_bingo_sheet(100, "alice")
-    sheet = store.get_bingo_sheet(100)
-    wrong = (sheet % 15) + 1
-    monkeypatch.setattr(bingo.ocr, "read_submission",
-                        lambda s, b, i: {"corner": wrong, "cells": []})
-    ctx = _context()
-    ctx.user_data["awaiting_bingo"] = True
-    tg_file = AsyncMock()
-    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"img"))
-    ctx.bot.get_file = AsyncMock(return_value=tg_file)
-    upd = _photo_update(100, "alice")
-    asyncio.run(bingo.on_bingo_image(upd, ctx))
-    upd.effective_message.reply_text.assert_awaited()      # rejection message
-    assert store.active_submission(100) is None            # NOT stranded pending
 
 
 # --- confirm_button -> pass -> claim + announce + DM ------------------------
