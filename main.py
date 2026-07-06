@@ -48,6 +48,7 @@ MENU_COMMANDS = [
     BotCommand("slot", "Is this group AM or PM?"),
     BotCommand("attendance", "Post an attendance poll"),
     BotCommand("get_bingo", "Get your Human Bingo card"),
+    BotCommand("submit_bingo", "Submit your filled bingo card"),
 ]
 
 
@@ -56,6 +57,7 @@ async def _on_startup(app):
     await app.bot.set_my_commands(MENU_COMMANDS)
     reminders.schedule_reminders(app)
     attendance.schedule_attendance_polls(app)
+    bingo.rearm_bingo_timeouts(app)
     log.info("bot is up and running")
 
 

@@ -54,8 +54,12 @@ def test_get_bingo_only_works_in_private(monkeypatch):
     upd.effective_message.reply_text.assert_called_once()
 
 
-def test_wiring_registers_get_bingo_in_menu_and_help():
+def test_wiring_registers_bingo_commands_in_menu_and_help():
     import main
     from handlers import common
-    assert "get_bingo" in [c.command for c in main.MENU_COMMANDS]
+    cmds = [c.command for c in main.MENU_COMMANDS]
+    assert "get_bingo" in cmds
+    assert "submit_bingo" in cmds
     assert "get_bingo" in common.HELP_TEXT
+    assert "submit_bingo" in common.HELP_TEXT
+    assert hasattr(bingo, "rearm_bingo_timeouts")
