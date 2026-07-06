@@ -36,36 +36,13 @@ from setup import sheets
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Roster cache — shared by get_bingo (_is_year1) and the submit pipeline
-# (_roster_index). The legacy _roster_handles set is kept for _is_year1;
-# the richer _ROSTER_INDEX dict is used by the OCR side.
+# Roster index — used by the submit pipeline to fuzzy-match typed handles
+# against the known Year 1 handles. /get_bingo does NOT gate on the roster:
+# anyone who DMs the bot gets a card, so a Year 1 who's missing from the sheet
+# can still play.
 # ---------------------------------------------------------------------------
 
-_roster_handles = None   # set of Year 1 @handles (lowercased, no @) — for /get_bingo
 _ROSTER_INDEX = None     # full index dict built by bingo_ocr.build_roster_index
-
-
-def _load_roster_handles():
-    """Load the Year 1 handle set once (cached). Leaves the cache empty and
-    retries next time if the sheet can't be reached, so a transient failure
-    doesn't lock everyone out permanently."""
-    global _roster_handles
-    if _roster_handles is not None:
-        return
-    try:
-        handles = set()
-        for members in sheets.load_year1_members().values():
-            for m in members:
-                if m.get("handle"):
-                    handles.add(m["handle"])
-        _roster_handles = handles
-    except Exception as exc:
-        log.warning("couldn't load Year 1 roster for bingo: %s", exc)
-
-
-def _is_year1(username):
-    _load_roster_handles()
-    return sheets.normalize_handle(username or "") in (_roster_handles or set())
 
 
 def _roster_index():
@@ -97,14 +74,11 @@ async def get_bingo(update, context):
         return
 
     user = update.effective_user
-    if not _is_year1(user.username if user else None):
-        await update.effective_message.reply_text(
-            "Hmm, I couldn't find you on the Year 1 list, so I can't hand you a "
-            "bingo card 😕\n\nMake sure your Telegram @username matches the one you "
-            "signed up with, or check with a facil."
-        )
+    if user is None:
         return
 
+    # Open to anyone who DMs the bot — a Year 1 who isn't on the sheet still
+    # gets a (deterministically allocated, even) card so they can play.
     sheet_no = storage.allocate_bingo_sheet(user.id, (user.username or "").lower())
     path = templates.template_path(sheet_no)
     caption = (
@@ -290,7 +264,10 @@ async def on_bingo_image(update, context):
     # wrong-sheet defence: a confident, mismatched corner number rejects
     corner = read.get("corner")
     if corner is not None and corner != sheet_no:
-        storage.start_bingo_submission(uid, handle, sheet_no, corner)
+        # Record the attempt (so the retry cooldown still applies) but resolve it
+        # immediately — leaving it 'pending' would block the user's next submit.
+        rejected = storage.start_bingo_submission(uid, handle, sheet_no, corner)
+        storage.set_submission_status(rejected, "rejected")
         await update.effective_message.reply_text(
             f"This looks like sheet #{corner}, but you were given sheet "
             f"#{sheet_no}. Please send your own card 🙂"

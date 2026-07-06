@@ -5,8 +5,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 from handlers import bingo
 
-FAKE_ROSTER = {"AM1": [{"name": "Tan Wei Xuan", "handle": "theoverlord27"}]}
-
 
 def _dm_update(username, uid=111):
     upd = MagicMock()
@@ -18,36 +16,32 @@ def _dm_update(username, uid=111):
     return upd
 
 
-def test_is_year1_is_case_and_at_tolerant(monkeypatch):
-    bingo._roster_handles = None
-    monkeypatch.setattr(bingo.sheets, "load_year1_members", lambda: FAKE_ROSTER)
-    assert bingo._is_year1("theoverlord27")
-    assert bingo._is_year1("@TheOverlord27")
-    assert not bingo._is_year1("someone_else")
-    assert not bingo._is_year1(None)
-
-
-def test_get_bingo_declines_non_roster(monkeypatch):
-    bingo._roster_handles = None
-    monkeypatch.setattr(bingo.sheets, "load_year1_members", lambda: FAKE_ROSTER)
-    upd = _dm_update("random_person")
-    asyncio.run(bingo.get_bingo(upd, MagicMock()))
-    upd.effective_message.reply_text.assert_called_once()
-    upd.effective_message.reply_document.assert_not_called()
-
-
-def test_get_bingo_sends_card_for_roster(monkeypatch):
-    bingo._roster_handles = None
-    monkeypatch.setattr(bingo.sheets, "load_year1_members", lambda: FAKE_ROSTER)
+def test_get_bingo_gives_a_card_to_anyone(monkeypatch):
+    # Not on the Year 1 roster? Still get a card.
     monkeypatch.setattr(bingo.storage, "allocate_bingo_sheet", lambda uid, h: 3)
-    upd = _dm_update("theoverlord27")
+    upd = _dm_update("someone_not_on_the_list")
     asyncio.run(bingo.get_bingo(upd, MagicMock()))
     upd.effective_message.reply_document.assert_called_once()
     upd.effective_message.reply_text.assert_not_called()
 
 
-def test_get_bingo_only_works_in_private(monkeypatch):
-    upd = _dm_update("theoverlord27")
+def test_get_bingo_allocates_by_user_id(monkeypatch):
+    seen = {}
+
+    def _alloc(uid, handle):
+        seen["uid"], seen["handle"] = uid, handle
+        return 7
+
+    monkeypatch.setattr(bingo.storage, "allocate_bingo_sheet", _alloc)
+    upd = _dm_update("TheOverlord27", uid=999)
+    asyncio.run(bingo.get_bingo(upd, MagicMock()))
+    assert seen["uid"] == 999
+    assert seen["handle"] == "theoverlord27"
+    upd.effective_message.reply_document.assert_called_once()
+
+
+def test_get_bingo_only_works_in_private():
+    upd = _dm_update("anyone")
     upd.effective_chat.type = "group"
     asyncio.run(bingo.get_bingo(upd, MagicMock()))
     upd.effective_message.reply_document.assert_not_called()

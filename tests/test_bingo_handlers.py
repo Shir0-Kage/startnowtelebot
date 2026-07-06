@@ -109,11 +109,12 @@ def test_line_verdict_pass_fail_pending(bingo):
 
 # --- get_bingo -------------------------------------------------------------
 
-def test_get_bingo_non_roster_declines(bingo):
+def test_get_bingo_non_roster_also_gets_a_card(bingo, store):
+    # A Year 1 who isn't on the sheet still gets a card (roster gate removed).
     upd, ctx = _update(user_id=999, username="stranger"), _context()
     asyncio.run(bingo.get_bingo(upd, ctx))
-    upd.effective_message.reply_text.assert_awaited()
-    assert not ctx.bot.send_photo.await_count  # nothing sent
+    upd.effective_message.reply_document.assert_awaited()
+    assert store.get_bingo_sheet(999) is not None
 
 
 def test_get_bingo_roster_sends_sheet_and_freezes(bingo, store):
@@ -219,6 +220,25 @@ def test_on_bingo_image_no_line_reports_and_cooldowns(bingo, store, monkeypatch)
     asyncio.run(bingo.on_bingo_image(upd, ctx))
     assert store.active_submission(100) is None  # nothing pending
     upd.effective_message.reply_text.assert_awaited()
+
+
+def test_on_bingo_image_wrong_sheet_does_not_strand_pending(bingo, store, monkeypatch):
+    # A mismatched corner number must be REJECTED without leaving a 'pending'
+    # row (which would lock the user out of /submit_bingo forever).
+    store.allocate_bingo_sheet(100, "alice")
+    sheet = store.get_bingo_sheet(100)
+    wrong = (sheet % 15) + 1
+    monkeypatch.setattr(bingo.ocr, "read_submission",
+                        lambda s, b, i: {"corner": wrong, "cells": []})
+    ctx = _context()
+    ctx.user_data["awaiting_bingo"] = True
+    tg_file = AsyncMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"img"))
+    ctx.bot.get_file = AsyncMock(return_value=tg_file)
+    upd = _photo_update(100, "alice")
+    asyncio.run(bingo.on_bingo_image(upd, ctx))
+    upd.effective_message.reply_text.assert_awaited()      # rejection message
+    assert store.active_submission(100) is None            # NOT stranded pending
 
 
 # --- confirm_button -> pass -> claim + announce + DM ------------------------
