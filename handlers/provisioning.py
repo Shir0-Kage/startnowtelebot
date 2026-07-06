@@ -7,6 +7,7 @@ their group from a facil deep link (facil-<OG>), their @username, or, if the
 handle doesn't match, the sign-up email they type in.
 """
 
+import asyncio
 import logging
 import re
 
@@ -34,58 +35,80 @@ def _og_from_title(title):
     return (m.group(1).upper() + m.group(2)) if m else None
 
 
+# The roster loaders below hit Google Sheets over BLOCKING urllib (incl. DNS,
+# which the socket timeout doesn't cover). They must therefore NEVER run on the
+# asyncio event loop — a slow or stalled fetch would freeze the whole bot and
+# even swallow Ctrl+C. So: loaders are plain sync functions run off the loop via
+# `ensure_rosters_loaded()` (asyncio.to_thread), and the `_og_by_*` accessors are
+# pure cache reads that never fetch. Loaders build into locals and assign the
+# module cache only on success, so a partial/concurrent load can't be observed
+# and a transient failure just retries on the next call.
+
+
 def _load_year1_maps():
     global _year1_by_handle, _year1_by_email
     if _year1_by_handle is not None:
         return
-    _year1_by_handle, _year1_by_email = {}, {}
     try:
+        by_handle, by_email = {}, {}
         for og, members in sheets.load_year1_members().items():
             for m in members:
                 if m.get("handle"):
-                    _year1_by_handle[m["handle"].lower()] = og
+                    by_handle[m["handle"].lower()] = og
                 if m.get("email"):
-                    _year1_by_email[m["email"].strip().lower()] = og
+                    by_email[m["email"].strip().lower()] = og
+        _year1_by_handle, _year1_by_email = by_handle, by_email
     except Exception as exc:
-        log.warning("couldn't load Year 1 roster: %s", exc)
-
-
-def _og_by_handle(username):
-    _load_year1_maps()
-    return _year1_by_handle.get((username or "").lower())
-
-
-def _og_by_email(email):
-    _load_year1_maps()
-    return _year1_by_email.get((email or "").strip().lower())
-
-
-def _reload_year1_maps():
-    """Drop the cached roster so the next lookup re-reads the sheet — used after
-    new Year 1s are added to the Year 1 sheet mid-programme."""
-    global _year1_by_handle, _year1_by_email
-    _year1_by_handle = None
-    _year1_by_email = None
-    _load_year1_maps()
+        log.warning("couldn't load Year 1 roster: %s", exc)  # leave unset -> retry
 
 
 def _load_facil_map():
     global _facil_by_handle
     if _facil_by_handle is not None:
         return
-    _facil_by_handle = {}
     try:
+        by_handle = {}
         for og, members in sheets.load_facil_members().items():
             for m in members:
                 if m.get("handle"):
-                    _facil_by_handle[m["handle"].lower()] = og
+                    by_handle[m["handle"].lower()] = og
+        _facil_by_handle = by_handle
     except Exception as exc:
-        log.warning("couldn't load facil roster: %s", exc)
+        log.warning("couldn't load facil roster: %s", exc)  # leave unset -> retry
+
+
+def _reload_year1_maps():
+    """Drop the cached Year 1 roster and re-read it — used after new Year 1s are
+    added to the sheet mid-programme. Sync (blocking); call off the event loop."""
+    global _year1_by_handle, _year1_by_email
+    _year1_by_handle = None
+    _year1_by_email = None
+    _load_year1_maps()
+
+
+async def ensure_rosters_loaded():
+    """Load the Year 1 + facil rosters OFF the event loop, so a blocking Google
+    fetch never freezes the bot. Cached after the first success; a failure just
+    leaves the cache unset to retry. Cheap once warm. Call before any _og_by_*
+    lookup, and once at startup to pre-warm."""
+    if _facil_by_handle is None:
+        await asyncio.to_thread(_load_facil_map)
+    if _year1_by_handle is None:
+        await asyncio.to_thread(_load_year1_maps)
+
+
+def _og_by_handle(username):
+    """Pure cache read (no fetch). Returns None if the roster isn't loaded yet —
+    callers await ensure_rosters_loaded() first."""
+    return (_year1_by_handle or {}).get((username or "").lower())
+
+
+def _og_by_email(email):
+    return (_year1_by_email or {}).get((email or "").strip().lower())
 
 
 def _og_by_facil_handle(username):
-    _load_facil_map()
-    return _facil_by_handle.get((username or "").lower())
+    return (_facil_by_handle or {}).get((username or "").lower())
 
 
 async def _group_link(bot, og):
@@ -161,6 +184,8 @@ async def try_send_group_link(update, context):
             await _send_facil_link(update, context, m.group(2).upper() + m.group(3))
             return True
 
+    await ensure_rosters_loaded()  # off the event loop; the lookups below are pure reads
+
     # facil matched by @username -> their link right away (facils aren't held)
     og = _og_by_facil_handle(update.effective_user.username)
     if og:
@@ -187,6 +212,7 @@ async def on_text(update, context):
     """A plain DM — used to collect the sign-up email once we've asked for it."""
     if not context.user_data.get("awaiting_email"):
         return
+    await ensure_rosters_loaded()  # off the event loop
     og = _og_by_email(update.effective_message.text)
     if not og:
         await update.effective_message.reply_text(
@@ -245,7 +271,7 @@ async def sync_year_ones(update, context):
     an OG that's already been opened we DM their join link now; for one that
     hasn't, we hold them for their facil. People who never /started the bot can't
     be reached and are skipped (they'll be onboarded the moment they /start)."""
-    _reload_year1_maps()
+    await asyncio.to_thread(_reload_year1_maps)  # off the event loop
     sent = held = 0
     for su in storage.get_started():
         uid = su["user_id"]

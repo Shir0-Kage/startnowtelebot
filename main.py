@@ -58,6 +58,9 @@ async def _on_startup(app):
     reminders.schedule_reminders(app)
     attendance.schedule_attendance_polls(app)
     bingo.rearm_bingo_timeouts(app)
+    # warm the Year 1 / facil rosters in the background (off the event loop) so
+    # the first /start is instant and a slow Google fetch never blocks startup
+    app.create_task(provisioning.ensure_rosters_loaded())
     log.info("bot is up and running")
 
 
