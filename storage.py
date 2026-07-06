@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from datetime import datetime
 
-from config import DB_PATH, TIMEZONE, REMINDERS_DEFAULT_ON
+from config import DB_PATH, TIMEZONE, REMINDERS_DEFAULT_ON, BINGO_PRIZE_LIMIT
 
 _lock = threading.Lock()
 _conn = None
@@ -91,6 +91,69 @@ CREATE TABLE IF NOT EXISTS year1_waiting (
     user_id INTEGER PRIMARY KEY,
     og      TEXT,
     since   TEXT
+);
+
+-- ===================================================================
+-- Human Bingo
+-- ===================================================================
+
+-- Frozen, even round-robin allocation of players to card templates (1..15).
+-- Keyed on user_id so a later @username change never loses their sheet.
+CREATE TABLE IF NOT EXISTS bingo_allocation (
+    user_id     INTEGER PRIMARY KEY,
+    handle      TEXT,              -- lowercased, no @ (best-effort, for audit)
+    sheet_no    INTEGER,
+    assigned_at TEXT
+);
+
+-- One row per submitted card. At most one 'pending' per submitter.
+CREATE TABLE IF NOT EXISTS bingo_submissions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    submitter_user_id INTEGER,
+    submitter_handle  TEXT,
+    sheet_no          INTEGER,
+    corner_read       INTEGER,     -- OCR'd top-left number, may be NULL
+    status            TEXT,        -- 'pending' | 'verified' | 'failed' | 'rejected'
+    submitted_at      TEXT,
+    verified_at       TEXT         -- set when it crosses the pass threshold
+);
+
+-- The chosen winning line's real (non-free) cells. prompt is frozen so the
+-- confirmation button text stays stable even if templates change.
+CREATE TABLE IF NOT EXISTS bingo_winning_members (
+    submission_id  INTEGER,
+    row            INTEGER,
+    col            INTEGER,
+    handle         TEXT,
+    prompt         TEXT,
+    target_user_id INTEGER,        -- resolved player, may be NULL (unreachable)
+    PRIMARY KEY (submission_id, row, col)
+);
+
+-- Game-wide Yes/No cache keyed on (subject, prompt): a popular person is DMed
+-- at most once per distinct prompt.
+CREATE TABLE IF NOT EXISTS bingo_confirmations (
+    subject_user_id INTEGER,
+    prompt          TEXT,
+    answer          TEXT,          -- 'yes' | 'no'
+    responded_at    TEXT,
+    PRIMARY KEY (subject_user_id, prompt)
+);
+
+-- Prize ledger + counter. UNIQUE winner is the last-line race guard.
+CREATE TABLE IF NOT EXISTS bingo_prizes (
+    winner_user_id INTEGER PRIMARY KEY,
+    handle         TEXT,
+    submission_id  INTEGER,
+    claim_no       INTEGER,
+    claimed_at     TEXT,
+    posted_at      TEXT            -- set once the channel post succeeds
+);
+
+-- Single-row flags (e.g. 'closed' once the 10th prize is claimed).
+CREATE TABLE IF NOT EXISTS bingo_flags (
+    name    TEXT PRIMARY KEY,
+    set_at  TEXT
 );
 """
 
@@ -387,3 +450,273 @@ def record_added(chat_id, handle):
             (chat_id, handle.lower(), _now_iso()),
         )
         _conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Human Bingo
+# ---------------------------------------------------------------------------
+
+def allocate_bingo_sheet(user_id, handle):
+    """Return this user's frozen card number, assigning one on first call.
+
+    Existing rows are never moved (frozen). A genuinely new user is dealt into
+    the currently-smallest sheet so counts stay even (differ by at most 1),
+    breaking ties toward the lowest sheet number for determinism."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT sheet_no FROM bingo_allocation WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row is not None:
+            return row["sheet_no"]
+        counts = {s: 0 for s in range(1, 16)}
+        for r in _conn.execute("SELECT sheet_no FROM bingo_allocation"):
+            if r["sheet_no"] in counts:
+                counts[r["sheet_no"]] += 1
+        # smallest count, then smallest sheet number
+        sheet_no = min(range(1, 16), key=lambda s: (counts[s], s))
+        _conn.execute(
+            "INSERT INTO bingo_allocation (user_id, handle, sheet_no, assigned_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, (handle or "").lower(), sheet_no, _now_iso()),
+        )
+        _conn.commit()
+        return sheet_no
+
+
+def get_bingo_sheet(user_id):
+    """The user's frozen sheet number, or None if never allocated."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT sheet_no FROM bingo_allocation WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row["sheet_no"] if row else None
+
+
+def user_id_for_handle(handle):
+    """Resolve a @handle to a user_id via started_users (they must have /started
+    for us to reach them). Returns None if no such user is known."""
+    h = (handle or "").lstrip("@").lower()
+    with _lock:
+        row = _conn.execute(
+            "SELECT user_id FROM started_users WHERE username = ?", (h,)
+        ).fetchone()
+    return row["user_id"] if row else None
+
+
+def bingo_is_closed():
+    """True once the game has been closed (10th prize claimed)."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT 1 FROM bingo_flags WHERE name = 'closed'"
+        ).fetchone()
+    return row is not None
+
+
+def set_bingo_closed():
+    """Persist the closed flag. Idempotent."""
+    with _lock:
+        _conn.execute(
+            "INSERT OR IGNORE INTO bingo_flags (name, set_at) VALUES ('closed', ?)",
+            (_now_iso(),),
+        )
+        _conn.commit()
+
+
+def active_submission(user_id):
+    """The submitter's current pending submission as a dict, or None."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT * FROM bingo_submissions "
+            "WHERE submitter_user_id = ? AND status = 'pending' "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def submission_by_id(submission_id):
+    """Any submission by its id, regardless of status, as a dict (or None).
+
+    Read-side pair to start_bingo_submission: the confirmation callback and the
+    12h timeout job use this to map a submission_id back to its submitter
+    (id, submitter_user_id, submitter_handle, status, sheet_no, ...)."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT * FROM bingo_submissions WHERE id = ?", (submission_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def last_bingo_activity(user_id):
+    """ISO timestamp of the user's most recent submission (for the retry
+    cooldown), or None if they've never submitted."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT submitted_at FROM bingo_submissions "
+            "WHERE submitter_user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return row["submitted_at"] if row else None
+
+
+def start_bingo_submission(user_id, handle, sheet_no, corner_read):
+    """Open a new pending submission and return its id."""
+    with _lock:
+        cur = _conn.execute(
+            "INSERT INTO bingo_submissions "
+            "(submitter_user_id, submitter_handle, sheet_no, corner_read, "
+            " status, submitted_at, verified_at) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, NULL)",
+            (user_id, (handle or "").lower(), sheet_no, corner_read, _now_iso()),
+        )
+        _conn.commit()
+        return cur.lastrowid
+
+
+def set_submission_status(submission_id, status, verified_at=None):
+    """Move a submission to a terminal (or pending) state. verified_at is set
+    only when provided (the moment it crossed the pass threshold)."""
+    with _lock:
+        if verified_at is None:
+            _conn.execute(
+                "UPDATE bingo_submissions SET status = ? WHERE id = ?",
+                (status, submission_id),
+            )
+        else:
+            _conn.execute(
+                "UPDATE bingo_submissions SET status = ?, verified_at = ? "
+                "WHERE id = ?",
+                (status, verified_at, submission_id),
+            )
+        _conn.commit()
+
+
+def record_winning_members(submission_id, members):
+    """Store the chosen line's real cells. members: list of dicts with keys
+    row, col, handle, prompt, target_user_id. Replaces any prior rows for
+    this submission."""
+    with _lock:
+        _conn.execute(
+            "DELETE FROM bingo_winning_members WHERE submission_id = ?",
+            (submission_id,),
+        )
+        _conn.executemany(
+            "INSERT INTO bingo_winning_members "
+            "(submission_id, row, col, handle, prompt, target_user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (submission_id, m["row"], m["col"], m["handle"],
+                 m["prompt"], m.get("target_user_id"))
+                for m in members
+            ],
+        )
+        _conn.commit()
+
+
+def winning_members(submission_id):
+    """The recorded line cells for a submission, ordered by (row, col)."""
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM bingo_winning_members WHERE submission_id = ? "
+            "ORDER BY row, col",
+            (submission_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_bingo_confirmation(subject_user_id, prompt, answer):
+    """Upsert a person's Yes/No for a prompt; the latest answer wins."""
+    with _lock:
+        _conn.execute(
+            "INSERT INTO bingo_confirmations "
+            "(subject_user_id, prompt, answer, responded_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(subject_user_id, prompt) DO UPDATE SET "
+            "    answer = excluded.answer, "
+            "    responded_at = excluded.responded_at",
+            (subject_user_id, prompt, answer, _now_iso()),
+        )
+        _conn.commit()
+
+
+def get_cached_confirmation(subject_user_id, prompt):
+    """The cached 'yes'/'no' for (subject, prompt), or None if unanswered."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT answer FROM bingo_confirmations "
+            "WHERE subject_user_id = ? AND prompt = ?",
+            (subject_user_id, prompt),
+        ).fetchone()
+    return row["answer"] if row else None
+
+
+def has_bingo_prize(user_id):
+    """True if this user has already won a prize."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT 1 FROM bingo_prizes WHERE winner_user_id = ?", (user_id,)
+        ).fetchone()
+    return row is not None
+
+
+def claim_bingo_prize(user_id, handle, submission_id):
+    """Atomically claim a prize slot. In ONE locked transaction: count existing
+    prizes, refuse if the game is full (>= BINGO_PRIZE_LIMIT) or this winner
+    already has one, else INSERT with claim_no = count + 1. Returns the slot
+    number (1..limit) or None. UNIQUE(winner_user_id) is the last-line guard."""
+    with _lock:
+        count = _conn.execute(
+            "SELECT COUNT(*) AS c FROM bingo_prizes"
+        ).fetchone()["c"]
+        if count >= BINGO_PRIZE_LIMIT:
+            return None
+        already = _conn.execute(
+            "SELECT 1 FROM bingo_prizes WHERE winner_user_id = ?", (user_id,)
+        ).fetchone()
+        if already is not None:
+            return None
+        claim_no = count + 1
+        try:
+            _conn.execute(
+                "INSERT INTO bingo_prizes "
+                "(winner_user_id, handle, submission_id, claim_no, "
+                " claimed_at, posted_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL)",
+                (user_id, (handle or "").lower(), submission_id, claim_no,
+                 _now_iso()),
+            )
+        except sqlite3.IntegrityError:
+            # concurrent duplicate winner slipped past the check — UNIQUE wins
+            _conn.rollback()
+            return None
+        _conn.commit()
+        return claim_no
+
+
+def bingo_prizes_claimed():
+    """How many prizes have been awarded (derived from the DB, never memory)."""
+    with _lock:
+        row = _conn.execute("SELECT COUNT(*) AS c FROM bingo_prizes").fetchone()
+    return row["c"]
+
+
+def mark_prize_posted(user_id):
+    """Record that this winner's channel announcement went out (once)."""
+    with _lock:
+        _conn.execute(
+            "UPDATE bingo_prizes SET posted_at = ? "
+            "WHERE winner_user_id = ? AND posted_at IS NULL",
+            (_now_iso(), user_id),
+        )
+        _conn.commit()
+
+
+def pending_submissions():
+    """All still-pending submissions (for re-arming 12h timeout jobs on
+    startup), ordered by submission time."""
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM bingo_submissions WHERE status = 'pending' "
+            "ORDER BY id"
+        ).fetchall()
+    return [dict(r) for r in rows]
