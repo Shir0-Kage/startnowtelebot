@@ -33,3 +33,7 @@ env/
 .vscode/
 .idea/
 .DS_Store
+
+# SDD scratch + agent worktrees (not for the repo)
+.superpowers/
+.claude/
