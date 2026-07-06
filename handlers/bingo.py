@@ -15,7 +15,9 @@ claim + best-effort channel post + submitter DM; close at 10. Unreachable
 subjects count as a miss.
 """
 
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -43,6 +45,10 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _ROSTER_INDEX = None     # full index dict built by bingo_ocr.build_roster_index
+
+# One dedicated worker thread for the CPU-heavy OCR, so a scan never blocks the
+# bot's event loop and simultaneous submissions queue instead of pegging the CPU.
+_OCR_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bingo-ocr")
 
 
 def _roster_index():
@@ -265,7 +271,13 @@ async def on_bingo_image(update, context):
         "Got your card! 🔍 Scanning it now — this can take up to a minute…"
     )
 
-    read = ocr.read_submission(sheet_no, image_bytes, _roster_index())
+    # Run the ~minute-long OCR OFF the event loop (onnxruntime releases the GIL
+    # during inference) via the single-worker pool, so the bot stays responsive
+    # and concurrent submissions queue instead of oversubscribing the CPU.
+    read = await asyncio.get_running_loop().run_in_executor(
+        _OCR_POOL,
+        lambda: ocr.read_submission(sheet_no, image_bytes, _roster_index()),
+    )
 
     # wrong-sheet defence: a confident, mismatched corner number rejects
     corner = read.get("corner")
