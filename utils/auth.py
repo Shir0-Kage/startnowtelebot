@@ -9,6 +9,7 @@ The @username check means facils can run facil commands whether or not they've
 been promoted to group admin. Use @facil_only on restricted command handlers.
 """
 
+import asyncio
 from functools import wraps
 
 from telegram.constants import ChatMemberStatus
@@ -51,8 +52,10 @@ async def is_facilitator(update, context):
         return True
 
     # recognised by their @username in the facil roster — so a facil can run
-    # facil commands even if they were never made a group admin
-    if sheets.normalize_handle(user.username or "") in _facil_handles_set():
+    # facil commands even if they were never made a group admin. The (cached)
+    # roster load hits the network, so run it off the event loop.
+    facil_handles = await asyncio.to_thread(_facil_handles_set)
+    if sheets.normalize_handle(user.username or "") in facil_handles:
         return True
 
     # in a group, fall back to Telegram's own admin list
