@@ -182,6 +182,37 @@ def _clean(text):
 
 
 # --- Fuzzy matcher ---------------------------------------------------------
+def _candidates(text):
+    """Pull handle-like substrings out of a noisy cell OCR string.
+
+    A filled cell usually contains the printed PROMPT *plus* the player's typed
+    "@handle" (e.g. "Favourite colour is purple @BFanL"), so matching the whole
+    string dilutes the handle. We try, in priority order: any @-prefixed token
+    (the strong signal), then each individual word (the handle may be typed
+    without an @), then the whole cleaned string as a last resort.
+    """
+    cands = []
+    # 1) @-prefixed tokens, straight from the raw text
+    for tok in re.findall(r"@\s*([A-Za-z0-9_]{2,})", text or ""):
+        cands.append(tok.lower())
+    # 2) individual word tokens (a handle may be typed without an @)
+    for w in re.sub(r"[^a-z0-9_@ ]", " ", (text or "").lower()).split():
+        w = w.lstrip("@")
+        if len(w) >= 3:
+            cands.append(w)
+    # 3) the whole cleaned string, as a fallback
+    whole = _clean(text)
+    if whole:
+        cands.append(whole)
+    # de-duplicate while preserving priority order
+    seen, out = set(), []
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def match_handle(text, index):
     """Return (result_handle, score) for the best confident match, else (None, 0.0).
 
@@ -189,13 +220,10 @@ def match_handle(text, index):
     >= BINGO_MATCH_MARGIN. The threshold is LENGTH-AWARE: for a short best key
     (<= 6 chars) it is raised by 7 points (spec §4 step 5), because a one-character
     OCR slip on a short handle is far more likely to land on the wrong person.
-    Tries cheap OCR-confusion variants and matches against handles + name tokens.
-    Rejected reads are logged so facils can audit misses.
+    Candidate handle substrings are pulled from the cell text (@-token, words,
+    whole) and matched against handles + name tokens, trying cheap OCR-confusion
+    variants. Rejected reads are logged so facils can audit misses.
     """
-    cleaned = _clean(text)
-    if not cleaned:
-        return None, 0.0
-
     keys = index["keys"]
     if not keys:
         return None, 0.0
@@ -203,25 +231,26 @@ def match_handle(text, index):
     best_key = None
     best_score = 0.0
     second_score = 0.0
-    for variant in _variants(cleaned):
-        if not variant:
-            continue
-        results = process.extract(
-            variant, keys, scorer=fuzz.WRatio, limit=2
-        )
-        if not results:
-            continue
-        top_key, top_score, _ = results[0]
-        runner = results[1][1] if len(results) > 1 else 0.0
-        if top_score > best_score:
-            best_score = top_score
-            best_key = top_key
-            # margin is measured within this variant's own ranking
-            second_score = runner
+    for cand in _candidates(text):
+        for variant in _variants(cand):
+            if not variant:
+                continue
+            results = process.extract(variant, keys, scorer=fuzz.WRatio, limit=2)
+            if not results:
+                continue
+            top_key, top_score, _ = results[0]
+            runner = results[1][1] if len(results) > 1 else 0.0
+            if top_score > best_score:
+                best_score = top_score
+                best_key = top_key
+                # margin is measured within this candidate's own ranking
+                second_score = runner
+
+    if best_key is None:
+        return None, 0.0
 
     # length-aware threshold: short handles must clear a higher bar
-    threshold = BINGO_MATCH_THRESHOLD + (7 if (best_key and len(best_key) <= 6) else 0)
-
+    threshold = BINGO_MATCH_THRESHOLD + (7 if len(best_key) <= 6 else 0)
     if best_score < threshold:
         log.info("bingo match rejected (below threshold): text=%r best_key=%r "
                  "best=%.1f threshold=%d", text, best_key, best_score, threshold)

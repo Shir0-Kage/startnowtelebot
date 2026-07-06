@@ -59,6 +59,25 @@ def test_ocr_confusion_variant_rescues_below_threshold(index):
     assert score >= 85
 
 
+def test_at_handle_extracted_from_prompt_text(index):
+    # A filled cell is the printed PROMPT plus the typed @handle; the handle must
+    # be pulled out even though the prompt text dominates the OCR string.
+    handle, _ = bingo_ocr.match_handle("Favourite colour is purple @Joshua_Lim", index)
+    assert handle == "joshua_lim"
+
+
+def test_handle_without_at_extracted_from_prompt_text(index):
+    # Same, but the player forgot the @ — the word token still matches.
+    handle, _ = bingo_ocr.match_handle("Has a film camera rocket", index)
+    assert handle == "rocket"
+
+
+def test_prompt_only_cell_matches_nothing(index):
+    # An unfilled cell (just the printed prompt) must NOT match a handle.
+    handle, _ = bingo_ocr.match_handle("Has nephews or nieces", index)
+    assert handle is None
+
+
 def test_ambiguous_below_margin_returns_none(index):
     # 'chloe_tar' is equidistant from chloe_tan and chloe_tam -> no clear winner.
     handle, score = bingo_ocr.match_handle("chloe_tar", index)
