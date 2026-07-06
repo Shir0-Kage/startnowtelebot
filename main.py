@@ -95,7 +95,12 @@ def main():
 
     # long-polling — simplest way to run; no public URL needed.
     # ALL_TYPES so we receive poll_answer updates (attendance votes).
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # drop_pending_updates: on restart, skip the backlog Telegram queued while
+    # the bot was down/frozen, so a pile of old /submit_bingo images can't
+    # immediately re-overload it. (Updates sent while offline are dropped.)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
