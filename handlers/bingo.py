@@ -259,6 +259,12 @@ async def on_bingo_image(update, context):
         )
         return
 
+    # OCR scans each cell one at a time and can take up to a minute, so let the
+    # player know their card arrived and is being worked on.
+    await update.effective_message.reply_text(
+        "Got your card! 🔍 Scanning it now — this can take up to a minute…"
+    )
+
     read = ocr.read_submission(sheet_no, image_bytes, _roster_index())
 
     # wrong-sheet defence: a confident, mismatched corner number rejects
