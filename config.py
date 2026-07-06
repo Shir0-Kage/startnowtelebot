@@ -30,6 +30,22 @@ def _parse_ids(raw):
 FACILITATORS = _parse_ids(os.environ.get("FACILITATOR_IDS"))
 
 
+# Facilitators listed by @username instead of numeric id — handy for admins
+# whose id we don't have. Anyone here is treated as a facilitator everywhere,
+# including DMs. @zzehao (lead organiser) is always included; add more with
+# FACILITATOR_HANDLES in .env, e.g. FACILITATOR_HANDLES=someone,another.
+def _parse_handles(raw):
+    out = set()
+    for chunk in (raw or "").split(","):
+        h = chunk.strip().lstrip("@").lower()
+        if h:
+            out.add(h)
+    return out
+
+
+FACILITATOR_HANDLES = {"zzehao"} | _parse_handles(os.environ.get("FACILITATOR_HANDLES"))
+
+
 # --- Time ------------------------------------------------------------------
 # Everything StartNOW! runs on Singapore time.
 SGT = ZoneInfo("Asia/Singapore")

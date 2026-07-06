@@ -38,7 +38,7 @@ Built with Python and [python-telegram-bot](https://docs.python-telegram-bot.org
 | `/slot` | Whether this group is AM or PM |
 | `/attendance` | Post an attendance poll (Going / Not going / Maybe) |
 
-**Facilitators only** (group admins, or IDs in `FACILITATOR_IDS`)
+**Facilitators only** (group admins, IDs in `FACILITATOR_IDS`, or @usernames in `FACILITATOR_HANDLES`)
 
 | Command | What it does |
 | --- | --- |
