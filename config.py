@@ -51,3 +51,25 @@ REMINDER_OFFSETS = [
 
 # Reminders are on by default for a new group; facils can toggle per chat.
 REMINDERS_DEFAULT_ON = True
+
+
+# --- Human Bingo -----------------------------------------------------------
+# Announcement channel for "N/10 prizes claimed!" posts. Default is the
+# StartNOW! 2026 group (decision #5); override per-deploy with ANNOUNCE_CHAT_ID.
+ANNOUNCE_CHAT_ID = int(os.environ.get("ANNOUNCE_CHAT_ID", "-1004292606016"))
+
+# First 10 winners take a prize; the game closes once the 10th is claimed.
+BINGO_PRIZE_LIMIT = 10
+
+# How long we wait for the people in a winning line to tap Yes/No before the
+# submission is finally evaluated with any still-pending cells counting as misses.
+BINGO_CONFIRM_TIMEOUT = timedelta(hours=12)
+
+# rapidfuzz score (0-100) an OCR'd cell must reach to count as a confident match...
+BINGO_MATCH_THRESHOLD = 85
+# ...and it must beat the second-best candidate by at least this margin, so an
+# ambiguous read degrades to an empty cell instead of guessing the wrong person.
+BINGO_MATCH_MARGIN = 8
+
+# Breather after a failed attempt before the same person may /submit_bingo again.
+BINGO_RETRY_COOLDOWN = timedelta(seconds=60)

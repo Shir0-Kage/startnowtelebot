@@ -5,5 +5,14 @@ python-dotenv>=1.0
 tzdata>=2024.1
 # only needed for the one-time group setup scripts in setup/ (user-account API)
 telethon>=1.36,<2
-# used by set_group_photo.py to flatten transparency + crop the group photo
+# Pillow: image loading + crop/preprocess for the Human Bingo OCR pipeline (runtime)
 Pillow>=10.0
+# Human Bingo OCR: RapidOCR ships PP-OCRv4 ONNX models in the wheel (offline, CPU).
+# NOTE: rapidocr-onnxruntime requires Python 3.10-3.12 (no 3.13 wheels yet).
+rapidocr-onnxruntime>=1.3,<2
+# headless build avoids the libGL.so.1 system dep on slim/container servers.
+# This is a transitive dep of rapidocr-onnxruntime (it imports cv2); we pin the
+# headless wheel so the container-safe build is the one that resolves.
+opencv-python-headless
+# fast fuzzy matching of OCR'd text against the 68-handle roster vocabulary
+rapidfuzz
