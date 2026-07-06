@@ -1,10 +1,12 @@
 """Facilitator/admin checks.
 
-A user counts as a facilitator if either:
-  - their Telegram user id is in the FACILITATOR_IDS list, or
+A user counts as a facilitator if any of:
+  - their Telegram user id is in the FACILITATOR_IDS list,
+  - their Telegram @username is one of the facils in the roster sheet, or
   - they're an admin/owner of the current group chat.
 
-Use the @facil_only decorator on command handlers that should be restricted.
+The @username check means facils can run facil commands whether or not they've
+been promoted to group admin. Use @facil_only on restricted command handlers.
 """
 
 from functools import wraps
@@ -12,8 +14,31 @@ from functools import wraps
 from telegram.constants import ChatMemberStatus
 
 import config
+from setup import sheets
 
 FACIL_ONLY_MESSAGE = "Sorry, that command is for facilitators only 🙏"
+
+_facil_handles = None   # cached set of facil @usernames (lowercased, no @)
+
+
+def _facil_handles_set():
+    """Known facil @usernames from the roster sheet (cached). Returns an empty
+    set — and retries on the next call — if the sheet can't be reached, so a
+    transient failure just falls back to the id/admin checks."""
+    global _facil_handles
+    if _facil_handles is not None:
+        return _facil_handles
+    try:
+        handles = set()
+        for members in sheets.load_facil_members().values():
+            for m in members:
+                h = sheets.normalize_handle(m.get("handle") or "")
+                if h:
+                    handles.add(h)
+        _facil_handles = handles
+        return _facil_handles
+    except Exception:
+        return set()
 
 
 async def is_facilitator(update, context):
@@ -23,6 +48,11 @@ async def is_facilitator(update, context):
         return False
 
     if user.id in config.FACILITATORS:
+        return True
+
+    # recognised by their @username in the facil roster — so a facil can run
+    # facil commands even if they were never made a group admin
+    if sheets.normalize_handle(user.username or "") in _facil_handles_set():
         return True
 
     # in a group, fall back to Telegram's own admin list
