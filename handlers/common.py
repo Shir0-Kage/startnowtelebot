@@ -27,6 +27,8 @@ HELP_TEXT = (
     "<b>📋 Attendance</b>\n"
     "/attendance — post an attendance poll (Going / Not going / Maybe)\n"
     "<i>(a poll also auto-posts 1 day before each meet-up)</i>\n\n"
+    "<b>🎉 Human Bingo</b>\n"
+    "/get_bingo — get your Human Bingo card and start playing\n\n"
     "<b>For facilitators 🛠️</b>\n"
     "/setslot am|pm — set this group's meet-up slot\n"
     "/reminders on|off — toggle reminders for this group\n"

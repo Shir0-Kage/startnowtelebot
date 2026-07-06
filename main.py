@@ -15,6 +15,7 @@ import storage
 from handlers import (
     announcements,
     attendance,
+    bingo,
     common,
     provisioning,
     quests,
@@ -46,6 +47,7 @@ MENU_COMMANDS = [
     BotCommand("engagements", "Optional sessions"),
     BotCommand("slot", "Is this group AM or PM?"),
     BotCommand("attendance", "Post an attendance poll"),
+    BotCommand("get_bingo", "Get your Human Bingo card"),
 ]
 
 
@@ -79,6 +81,7 @@ def main():
 
     # wire up each feature
     common.register(app)
+    bingo.register(app)
     quests.register(app)
     schedule.register(app)
     settings.register(app)
