@@ -6,7 +6,13 @@ winning-line detection and confirmations) is added on top of this module later.
 
 The full flow: gate on bingo_is_closed / has_bingo_prize / active_submission +
 cooldown; two-step image upload (context.user_data["awaiting_bingo"]); OCR via
-bingo_ocr.read_submission; corner-number wrong-sheet reject; winning_lines ->
+bingo_ocr.read_submission. The OCR read is never acted on straight away -- it's
+shown back to the player as a text preview (bingo_text.build_prefilled_text)
+with a Yes/No "does this look right?" keyboard (bingo_ocr_confirm_button).
+Yes proceeds with the original read; No re-arms awaiting_bingo_text with that
+same prefilled list so the player corrects it as plain text instead of
+re-photographing the card. From there (confirmed OCR or a from-scratch/edited
+text submission): corner-number wrong-sheet reject; winning_lines ->
 pick_best_line; record submission + winning_members; DM each reachable,
 non-self, non-cached subject a Yes/No inline keyboard, reusing cached
 confirmations, and arm a config.BINGO_CONFIRM_TIMEOUT job; confirm_button
@@ -30,6 +36,7 @@ from telegram.ext import (
 
 import bingo_lines as lines
 import bingo_ocr as ocr
+import bingo_text
 import config
 import storage
 from data import bingo_templates as templates
@@ -155,6 +162,38 @@ def _line_verdict(line, answers):
 # /submit_bingo — gate, then arm the one-shot image handler
 # ---------------------------------------------------------------------------
 
+def _bingo_gate_message(uid):
+    """None if the four submit-gates all pass, else the user-facing text for
+    whichever one didn't. Shared by submit_bingo (render time) and
+    bingo_mode_button (click time, since state can go stale in between)."""
+    if storage.bingo_is_closed():
+        return "All 10 prizes have been claimed — thanks for playing! 🎉"
+    if storage.has_bingo_prize(uid):
+        return "You've already won — give someone else a shot! 🏆"
+    if storage.active_submission(uid):
+        return (
+            "You already have a card being checked. Hang tight — I'll message "
+            "you the moment it's verified. ⏳"
+        )
+    if storage.get_bingo_sheet(uid) is None:
+        return "Grab your card first with /get_bingo, then send it back here 🙂"
+    return None
+
+
+def _ocr_confirm_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Looks right", callback_data="bingoocr:yes"),
+        InlineKeyboardButton("✏️ Let me fix it", callback_data="bingoocr:no"),
+    ]])
+
+
+def _mode_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📸 Photo", callback_data="bingomode:photo"),
+        InlineKeyboardButton("✍️ Text", callback_data="bingomode:text"),
+    ]])
+
+
 async def submit_bingo(update, context):
     chat = update.effective_chat
     if chat is None or chat.type != "private":
@@ -164,33 +203,66 @@ async def submit_bingo(update, context):
         return
 
     uid = update.effective_user.id
-    if storage.bingo_is_closed():
-        await update.effective_message.reply_text(
-            "All 10 prizes have been claimed — thanks for playing! 🎉"
-        )
-        return
-    if storage.has_bingo_prize(uid):
-        await update.effective_message.reply_text(
-            "You've already won — give someone else a shot! 🏆"
-        )
-        return
-    if storage.active_submission(uid):
-        await update.effective_message.reply_text(
-            "You already have a card being checked. Hang tight — I'll message you "
-            "the moment it's verified. ⏳"
-        )
-        return
-    if storage.get_bingo_sheet(uid) is None:
-        await update.effective_message.reply_text(
-            "Grab your card first with /get_bingo, then send it back here 🙂"
-        )
+    gate_message = _bingo_gate_message(uid)
+    if gate_message:
+        await update.effective_message.reply_text(gate_message)
         return
 
-    context.user_data["awaiting_bingo"] = True
     await update.effective_message.reply_text(
-        "Send me a photo of your filled bingo card (as a photo or an image "
-        "file) and I'll check it. 📸"
+        "How would you like to submit your filled card?",
+        reply_markup=_mode_keyboard(),
     )
+
+
+async def bingo_mode_button(update, context):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, mode = query.data.split(":", 1)
+    except (ValueError, AttributeError):
+        return
+    if mode not in ("photo", "text"):
+        return
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass  # message may be too old to edit
+
+    uid = query.from_user.id
+    gate_message = _bingo_gate_message(uid)
+    if gate_message:
+        # send via the bot API rather than query.message.reply_text: the
+        # tapped message may be too old for Telegram to consider "accessible"
+        # (same case the edit above already guards), and an inaccessible
+        # message has no reply_text method at all.
+        await context.bot.send_message(chat_id=uid, text=gate_message)
+        return
+
+    # arming one mode must clear the other -- otherwise a user who taps
+    # "Photo" on one /submit_bingo prompt and "Text" on an earlier one (both
+    # gates passed since neither had created a submission yet) ends up with
+    # both flags armed, and a later unrelated message -- or, after the retry
+    # cooldown lapses, a second real submission -- gets silently processed by
+    # the stale mode's handler.
+    if mode == "photo":
+        context.user_data["awaiting_bingo"] = True
+        context.user_data["awaiting_bingo_text"] = False
+        await context.bot.send_message(
+            chat_id=uid,
+            text="Send me a photo of your filled bingo card (as a photo or an "
+                 "image file) and I'll check it. 📸",
+        )
+    else:
+        context.user_data["awaiting_bingo_text"] = True
+        context.user_data["awaiting_bingo"] = False
+        sheet_no = storage.get_bingo_sheet(uid)
+        await context.bot.send_message(
+            chat_id=uid,
+            text="Reply with this list, adding an @handle after the dash for "
+                 "every square you've matched (leave the rest blank):\n\n"
+                 + bingo_text.build_template_text(sheet_no),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +351,64 @@ async def on_bingo_image(update, context):
         lambda: ocr.read_submission(sheet_no, image_bytes, _roster_index()),
     )
 
-    # wrong-sheet defence: a confident, mismatched corner number rejects
+    # Never act on a raw OCR read -- show it back as text and let the player
+    # confirm or correct it first (bingo_ocr_confirm_button).
+    context.user_data["bingo_ocr_pending"] = {
+        "sheet_no": sheet_no, "read": read, "handle": handle,
+    }
+    preview = bingo_text.build_prefilled_text(sheet_no, read.get("cells", []))
+    await update.effective_message.reply_text(
+        "Here's what I read off your card — only the squares I'm confident "
+        "about are filled in:\n\n" + preview + "\n\nDoes that look right?",
+        reply_markup=_ocr_confirm_keyboard(),
+    )
+
+
+async def on_bingo_text(update, context):
+    if not context.user_data.get("awaiting_bingo_text"):
+        return  # not expecting typed handles from this user; ignore
+    context.user_data["awaiting_bingo_text"] = False
+
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return
+
+    uid = update.effective_user.id
+    handle = sheets.normalize_handle(update.effective_user.username) or ""
+
+    if storage.bingo_is_closed():
+        await update.effective_message.reply_text(
+            "All 10 prizes have been claimed — thanks for playing! 🎉"
+        )
+        return
+    wait = _cooldown_remaining(uid)
+    if wait:
+        await update.effective_message.reply_text(
+            f"Hold on {wait}s before trying again 🙂"
+        )
+        return
+
+    sheet_no = storage.get_bingo_sheet(uid)
+    if sheet_no is None:
+        await update.effective_message.reply_text(
+            "Grab your card first with /get_bingo 🙂"
+        )
+        return
+
+    read = bingo_text.parse_submission(
+        sheet_no, update.effective_message.text or "", _roster_index()
+    )
+    await _process_read(update, context, uid, handle, sheet_no, read)
+
+
+async def _process_read(update, context, uid, handle, sheet_no, read):
+    """Shared tail for both submission modes: takes read_submission()'s (or
+    bingo_text.parse_submission()'s) {"corner", "cells"} shape and does the
+    wrong-sheet check, line detection, recording, and subject DMs."""
+    # wrong-sheet defence: a confident, mismatched corner number rejects.
+    # Always None for text submissions, so this is a no-op there -- there's
+    # no spoofing risk anyway since _matched_and_prompts always pulls prompts
+    # from the caller's own server-side sheet_no, never client input.
     corner = read.get("corner")
     if corner is not None and corner != sheet_no:
         # Record the attempt (so the retry cooldown still applies) but resolve it
@@ -332,6 +461,62 @@ async def on_bingo_image(update, context):
 
     # re-evaluate immediately in case cached answers already clinch it
     await _finalize(context, submission_id)
+
+
+# ---------------------------------------------------------------------------
+# OCR preview confirmation — "does this look right?" before acting on a read
+# ---------------------------------------------------------------------------
+
+async def bingo_ocr_confirm_button(update, context):
+    """Yes/No on the OCR preview shown after on_bingo_image.
+
+    Yes proceeds with the original OCR read exactly as scanned (via
+    _process_read, same as the text path). No discards it and re-arms
+    awaiting_bingo_text with that same read pre-filled as text (see
+    bingo_text.build_prefilled_text), so the player corrects only the wrong
+    or missing squares instead of re-photographing the whole card.
+    """
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, ans = query.data.split(":", 1)
+    except (ValueError, AttributeError):
+        return
+    if ans not in ("yes", "no"):
+        return
+
+    pending = context.user_data.pop("bingo_ocr_pending", None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass  # message may be too old to edit
+
+    if pending is None:
+        return  # stale button -- already actioned, or user_data reset since
+
+    uid = query.from_user.id
+    # state (closed/won/another submission started meanwhile) can go stale
+    # between the OCR preview rendering and the tap, same as bingo_mode_button.
+    gate_message = _bingo_gate_message(uid)
+    if gate_message:
+        await context.bot.send_message(chat_id=uid, text=gate_message)
+        return
+
+    if ans == "no":
+        context.user_data["awaiting_bingo_text"] = True
+        preview = bingo_text.build_prefilled_text(
+            pending["sheet_no"], pending["read"].get("cells", [])
+        )
+        await context.bot.send_message(
+            chat_id=uid,
+            text="No worries — fix the @handles below and send the whole "
+                 "list back to me:\n\n" + preview,
+        )
+        return
+
+    await _process_read(
+        update, context, uid, pending["handle"], pending["sheet_no"], pending["read"],
+    )
 
 
 def _confirm_keyboard(submission_id, row, col):
@@ -616,7 +801,23 @@ def register(app):
     app.add_handler(CommandHandler("get_bingo", get_bingo))
     app.add_handler(CommandHandler("submit_bingo", submit_bingo))
     app.add_handler(CallbackQueryHandler(confirm_button, pattern=r"^bingoconf:"))
+    app.add_handler(CallbackQueryHandler(bingo_mode_button, pattern=r"^bingomode:"))
+    app.add_handler(CallbackQueryHandler(bingo_ocr_confirm_button, pattern=r"^bingoocr:"))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & (filters.PHOTO | filters.Document.IMAGE),
         on_bingo_image,
     ))
+    # group=1, NOT the default group 0: handlers/provisioning.py registers a
+    # MessageHandler with the IDENTICAL filter (private text, non-command) in
+    # the default group for its awaiting_email flow, and main.py registers
+    # bingo.register(app) before provisioning.register(app). Within one PTB
+    # group, only the first handler whose filter matches gets invoked, and
+    # that group's dispatch stops there for the update -- a handler's own
+    # "return early if my flag isn't set" guard does NOT let a later handler
+    # in the SAME group also run. Putting this in group=1 makes PTB evaluate
+    # both handlers independently for every private text message; each still
+    # no-ops via its own user_data flag when not relevant.
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+        on_bingo_text,
+    ), group=1)

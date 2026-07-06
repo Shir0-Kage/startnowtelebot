@@ -70,6 +70,47 @@ def _context():
     return ctx
 
 
+def _text_update(user_id=100, username="alice", text=""):
+    upd = _update(user_id=user_id, username=username, text=text)
+    upd.effective_message.text = text
+    upd.effective_message.photo = None
+    upd.effective_message.document = None
+    return upd
+
+
+def _tap_mode(bingo, ctx, uid, mode):
+    q = AsyncMock()
+    q.data = f"bingomode:{mode}"
+    q.answer = AsyncMock()
+    q.edit_message_reply_markup = AsyncMock()
+    q.from_user = SimpleNamespace(id=uid)
+    q.message = MagicMock()
+    q.message.reply_text = AsyncMock()
+    upd = MagicMock()
+    upd.callback_query = q
+    upd.effective_user = SimpleNamespace(id=uid)
+    asyncio.run(bingo.bingo_mode_button(upd, ctx))
+    return q
+
+
+def _tap_ocr_confirm(bingo, ctx, uid, ans, username="alice"):
+    q = AsyncMock()
+    q.data = f"bingoocr:{ans}"
+    q.answer = AsyncMock()
+    q.edit_message_reply_markup = AsyncMock()
+    q.from_user = SimpleNamespace(id=uid, username=username)
+    q.message = MagicMock()
+    q.message.reply_text = AsyncMock()
+    upd = MagicMock()
+    upd.callback_query = q
+    upd.effective_user = SimpleNamespace(id=uid, username=username)
+    # mirrors real PTB: Update.effective_message falls back to the callback
+    # query's own message when there's no top-level message on the update.
+    upd.effective_message = q.message
+    asyncio.run(bingo.bingo_ocr_confirm_button(upd, ctx))
+    return q
+
+
 # --- helper: matched dict + prompt map from OCR cells ----------------------
 
 def test_matched_and_prompts_drops_non_match_and_self(bingo, monkeypatch):
@@ -131,12 +172,63 @@ def test_get_bingo_roster_sends_sheet_and_freezes(bingo, store):
 
 # --- submit_bingo gating ---------------------------------------------------
 
-def test_submit_bingo_sets_flag_when_open(bingo, store):
+def test_submit_bingo_shows_mode_choice_when_open(bingo, store):
     store.allocate_bingo_sheet(100, "alice")  # must have a card first
     upd, ctx = _update(user_id=100, username="alice", text="/submit_bingo"), _context()
     asyncio.run(bingo.submit_bingo(upd, ctx))
-    assert ctx.user_data.get("awaiting_bingo") is True
+    # neither mode is armed yet -- the user still has to tap a button
+    assert not ctx.user_data.get("awaiting_bingo")
+    assert not ctx.user_data.get("awaiting_bingo_text")
     upd.effective_message.reply_text.assert_awaited()
+    _, kwargs = upd.effective_message.reply_text.call_args
+    buttons = [b for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert {b.callback_data for b in buttons} == {"bingomode:photo", "bingomode:text"}
+
+
+def test_bingo_mode_button_photo_arms_awaiting_bingo(bingo, store):
+    store.allocate_bingo_sheet(100, "alice")
+    ctx = _context()
+    _tap_mode(bingo, ctx, 100, "photo")
+    assert ctx.user_data.get("awaiting_bingo") is True
+    assert not ctx.user_data.get("awaiting_bingo_text")
+    # sent via the bot API, not query.message.reply_text -- the tapped
+    # message may be too old/inaccessible to reply through directly
+    ctx.bot.send_message.assert_awaited()
+
+
+def test_bingo_mode_button_text_arms_awaiting_bingo_text_and_sends_template(bingo, store):
+    store.allocate_bingo_sheet(100, "alice")
+    ctx = _context()
+    _tap_mode(bingo, ctx, 100, "text")
+    assert ctx.user_data.get("awaiting_bingo_text") is True
+    assert not ctx.user_data.get("awaiting_bingo")
+    sent_text = ctx.bot.send_message.call_args.kwargs["text"]
+    assert "R1C1" in sent_text and "R3C3" not in sent_text
+
+
+def test_bingo_mode_button_regates_at_click_time(bingo, store, monkeypatch):
+    # state can go stale between the buttons rendering and the tap
+    store.allocate_bingo_sheet(100, "alice")
+    monkeypatch.setattr(store, "has_bingo_prize", lambda uid: True)
+    ctx = _context()
+    _tap_mode(bingo, ctx, 100, "photo")
+    assert not ctx.user_data.get("awaiting_bingo")
+    assert not ctx.user_data.get("awaiting_bingo_text")
+    ctx.bot.send_message.assert_awaited()  # rejection message, not the photo prompt
+
+
+def test_bingo_mode_button_arming_one_mode_clears_the_other(bingo, store):
+    # regression: a user who taps "Photo" on one /submit_bingo prompt and
+    # "Text" on an earlier one (both gates passed since neither had a
+    # submission yet) must not end up with BOTH flags armed -- whichever is
+    # tapped last must win outright.
+    store.allocate_bingo_sheet(100, "alice")
+    ctx = _context()
+    _tap_mode(bingo, ctx, 100, "text")
+    assert ctx.user_data.get("awaiting_bingo_text") is True
+    _tap_mode(bingo, ctx, 100, "photo")
+    assert ctx.user_data.get("awaiting_bingo") is True
+    assert ctx.user_data.get("awaiting_bingo_text") is False
 
 
 def test_submit_bingo_blocked_when_closed(bingo, store):
@@ -163,11 +255,40 @@ def _photo_update(user_id=100, username="alice"):
     return upd
 
 
-def test_on_bingo_image_records_line_and_dms_subjects(bingo, store, monkeypatch):
+def test_on_bingo_image_shows_preview_and_waits_for_confirmation(bingo, store, monkeypatch):
     # allocate sheet 1 for the submitter (id 100)
     store.allocate_bingo_sheet(100, "alice")
-    sheet = store.get_bingo_sheet(100)
-    # register subjects so they're reachable
+
+    def fake_read(sheet_no, image_bytes, index):
+        return {"corner": sheet_no, "cells": [
+            {"row": 0, "col": 0, "handle": "bob", "score": 95.0},
+        ]}
+    monkeypatch.setattr(bingo.ocr, "read_submission", fake_read)
+
+    ctx = _context()
+    ctx.user_data["awaiting_bingo"] = True
+    tg_file = AsyncMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"img"))
+    ctx.bot.get_file = AsyncMock(return_value=tg_file)
+
+    upd = _photo_update(100, "alice")
+    asyncio.run(bingo.on_bingo_image(upd, ctx))
+
+    # nothing acted on yet -- no submission, no subject DMs
+    assert store.active_submission(100) is None
+    ctx.bot.send_message.assert_not_awaited()
+    pending = ctx.user_data.get("bingo_ocr_pending")
+    assert pending is not None
+    assert pending["sheet_no"] == store.get_bingo_sheet(100)
+    # last reply is the preview + confirm keyboard, with the matched handle shown
+    last_call = upd.effective_message.reply_text.call_args
+    assert "@bob" in last_call.args[0]
+    assert {b.callback_data for row in last_call.kwargs["reply_markup"].inline_keyboard for b in row} \
+        == {"bingoocr:yes", "bingoocr:no"}
+
+
+def test_ocr_confirm_yes_records_line_and_dms_subjects(bingo, store, monkeypatch):
+    store.allocate_bingo_sheet(100, "alice")
     for uid, h in [(1, "bob"), (2, "cara"), (3, "dan"), (4, "eve")]:
         store.mark_started(uid, h, h.title())
 
@@ -187,13 +308,14 @@ def test_on_bingo_image_records_line_and_dms_subjects(bingo, store, monkeypatch)
 
     ctx = _context()
     ctx.user_data["awaiting_bingo"] = True
-    # bot.get_file -> file whose download_as_bytearray returns image bytes
     tg_file = AsyncMock()
     tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"img"))
     ctx.bot.get_file = AsyncMock(return_value=tg_file)
-
     upd = _photo_update(100, "alice")
     asyncio.run(bingo.on_bingo_image(upd, ctx))
+    assert store.active_submission(100) is None  # still just a preview
+
+    _tap_ocr_confirm(bingo, ctx, 100, "yes")
 
     sub = store.active_submission(100)
     assert sub is not None and sub["status"] == "pending"
@@ -203,10 +325,36 @@ def test_on_bingo_image_records_line_and_dms_subjects(bingo, store, monkeypatch)
     assert ctx.bot.send_message.await_count == 4
     # a 12h timeout job was armed
     ctx.job_queue.run_once.assert_called_once()
-    assert ctx.user_data.get("awaiting_bingo") is not True
+    assert ctx.user_data.get("bingo_ocr_pending") is None
 
 
-def test_on_bingo_image_no_line_reports_and_cooldowns(bingo, store, monkeypatch):
+def test_ocr_confirm_no_arms_text_mode_with_prefilled_list(bingo, store, monkeypatch):
+    store.allocate_bingo_sheet(100, "alice")
+
+    def fake_read(sheet_no, image_bytes, index):
+        return {"corner": sheet_no, "cells": [
+            {"row": 0, "col": 0, "handle": "bob", "score": 95.0},
+        ]}
+    monkeypatch.setattr(bingo.ocr, "read_submission", fake_read)
+
+    ctx = _context()
+    ctx.user_data["awaiting_bingo"] = True
+    tg_file = AsyncMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"img"))
+    ctx.bot.get_file = AsyncMock(return_value=tg_file)
+    upd = _photo_update(100, "alice")
+    asyncio.run(bingo.on_bingo_image(upd, ctx))
+
+    _tap_ocr_confirm(bingo, ctx, 100, "no")
+
+    assert ctx.user_data.get("awaiting_bingo_text") is True
+    assert ctx.user_data.get("bingo_ocr_pending") is None
+    assert store.active_submission(100) is None  # nothing recorded yet
+    sent_text = ctx.bot.send_message.call_args.kwargs["text"]
+    assert "@bob" in sent_text and "R1C1" in sent_text
+
+
+def test_ocr_confirm_yes_no_line_reports_and_no_submission(bingo, store, monkeypatch):
     store.allocate_bingo_sheet(100, "alice")
     monkeypatch.setattr(bingo.ocr, "read_submission",
                         lambda s, b, i: {"corner": s, "cells": []})
@@ -218,11 +366,14 @@ def test_on_bingo_image_no_line_reports_and_cooldowns(bingo, store, monkeypatch)
     ctx.bot.get_file = AsyncMock(return_value=tg_file)
     upd = _photo_update(100, "alice")
     asyncio.run(bingo.on_bingo_image(upd, ctx))
+
+    q = _tap_ocr_confirm(bingo, ctx, 100, "yes")
+
     assert store.active_submission(100) is None  # nothing pending
-    upd.effective_message.reply_text.assert_awaited()
+    q.message.reply_text.assert_awaited()  # "no bingo yet" message
 
 
-def test_on_bingo_image_wrong_sheet_does_not_strand_pending(bingo, store, monkeypatch):
+def test_ocr_confirm_yes_wrong_sheet_does_not_strand_pending(bingo, store, monkeypatch):
     # A mismatched corner number must be REJECTED without leaving a 'pending'
     # row (which would lock the user out of /submit_bingo forever).
     store.allocate_bingo_sheet(100, "alice")
@@ -237,8 +388,139 @@ def test_on_bingo_image_wrong_sheet_does_not_strand_pending(bingo, store, monkey
     ctx.bot.get_file = AsyncMock(return_value=tg_file)
     upd = _photo_update(100, "alice")
     asyncio.run(bingo.on_bingo_image(upd, ctx))
-    upd.effective_message.reply_text.assert_awaited()      # rejection message
-    assert store.active_submission(100) is None            # NOT stranded pending
+
+    q = _tap_ocr_confirm(bingo, ctx, 100, "yes")
+
+    q.message.reply_text.assert_awaited()                  # rejection message
+    assert store.active_submission(100) is None             # NOT stranded pending
+
+
+def test_ocr_confirm_stale_button_is_a_no_op(bingo, store):
+    # bingo_ocr_pending already consumed (or bot restarted) -- must not crash
+    # or act on a phantom read.
+    store.allocate_bingo_sheet(100, "alice")
+    ctx = _context()
+    q = _tap_ocr_confirm(bingo, ctx, 100, "yes")
+    ctx.bot.send_message.assert_not_awaited()
+    assert store.active_submission(100) is None
+
+
+# --- on_bingo_text full pipeline -> pending + DMs subjects ------------------
+
+def test_on_bingo_text_full_pipeline_success(bingo, store, monkeypatch):
+    # real Telegram usernames are 5-32 chars; use a roster with realistic
+    # handles so normalize_handle doesn't reject a typed handle for being
+    # too short (unlike the default short-handle roster used elsewhere,
+    # which OCR mode can get away with since it never runs typed input
+    # through normalize_handle).
+    long_roster = {
+        "AM1": [
+            {"name": "Alice Tan", "handle": "alice", "email": "a@x.com", "addable": True},
+            {"name": "Bobby Lee", "handle": "bobby", "email": "b@x.com", "addable": True},
+            {"name": "Carol Ng", "handle": "carol", "email": "c@x.com", "addable": True},
+            {"name": "Daniel Ong", "handle": "daniel", "email": "d@x.com", "addable": True},
+            {"name": "Evelyn Sim", "handle": "evelyn", "email": "e@x.com", "addable": True},
+        ],
+    }
+    monkeypatch.setattr(bingo.sheets, "load_year1_members", lambda: long_roster)
+    bingo._ROSTER_INDEX = None
+
+    store.allocate_bingo_sheet(100, "alice")
+    for uid, h in [(1, "bobby"), (2, "carol"), (3, "daniel"), (4, "evelyn")]:
+        store.mark_started(uid, h, h.title())
+
+    monkeypatch.setattr(
+        bingo.lines, "winning_lines",
+        lambda matched, sub: [[(0, 0, "bobby"), (0, 1, "carol"), (0, 3, "daniel"), (0, 4, "evelyn")]],
+    )
+
+    ctx = _context()
+    ctx.user_data["awaiting_bingo_text"] = True
+    body = "\n".join([
+        "R1C1: p - @bobby",
+        "R1C2: p - @carol",
+        "R1C4: p - @daniel",
+        "R1C5: p - @evelyn",
+    ])
+    upd = _text_update(100, "alice", body)
+    asyncio.run(bingo.on_bingo_text(upd, ctx))
+
+    sub = store.active_submission(100)
+    assert sub is not None and sub["status"] == "pending"
+    members = store.winning_members(sub["id"])
+    assert {m["handle"] for m in members} == {"bobby", "carol", "daniel", "evelyn"}
+    assert ctx.bot.send_message.await_count == 4
+    ctx.job_queue.run_once.assert_called_once()
+    assert ctx.user_data.get("awaiting_bingo_text") is not True
+
+
+def test_on_bingo_text_exact_match_miss_degrades_gracefully(bingo, store, monkeypatch):
+    # a typed handle that isn't on the roster is not fuzzy-rescued -- the
+    # cell just stays unmatched, same as a low-confidence OCR read.
+    store.allocate_bingo_sheet(100, "alice")
+    monkeypatch.setattr(bingo.lines, "winning_lines", lambda matched, sub: [])
+    ctx = _context()
+    ctx.user_data["awaiting_bingo_text"] = True
+    upd = _text_update(100, "alice", "R1C1: p - @ghostwriter")
+    asyncio.run(bingo.on_bingo_text(upd, ctx))
+    assert store.active_submission(100) is None
+    upd.effective_message.reply_text.assert_awaited()
+
+
+def test_on_bingo_text_ignores_when_flag_not_set(bingo, store):
+    ctx = _context()  # awaiting_bingo_text never armed
+    upd = _text_update(100, "alice", "R1C1: p - @alice")
+    asyncio.run(bingo.on_bingo_text(upd, ctx))
+    upd.effective_message.reply_text.assert_not_awaited()
+    assert store.active_submission(100) is None
+
+
+# --- group-collision regression: text handler must not shadow provisioning --
+
+def test_bingo_text_handler_does_not_shadow_provisioning_on_text(store, monkeypatch):
+    """handlers/provisioning.py registers an identically-filtered private-text
+    MessageHandler in the default group for its awaiting_email flow. If
+    handlers.bingo's text handler were registered in that same default group
+    (instead of group=1), PTB would only ever invoke the first-registered
+    handler for a private text message and provisioning.on_text would never
+    run again. This exercises real PTB dispatch (not just calling the handler
+    functions directly) so it would actually catch that regression."""
+    import asyncio as _asyncio
+    from datetime import datetime as _datetime
+
+    from telegram import Chat, Message, Update, User
+    from telegram.ext import Application
+
+    import handlers.bingo as bingo_mod
+    import handlers.provisioning as provisioning_mod
+    importlib.reload(bingo_mod)
+    importlib.reload(provisioning_mod)
+
+    bingo_mock = AsyncMock()
+    provisioning_mock = AsyncMock()
+    monkeypatch.setattr(bingo_mod, "on_bingo_text", bingo_mock)
+    monkeypatch.setattr(provisioning_mod, "on_text", provisioning_mock)
+
+    app = Application.builder().token("123456789:AAEexampletesttoken0000000000000000").build()
+    # same registration order as main.py: bingo before provisioning
+    bingo_mod.register(app)
+    provisioning_mod.register(app)
+    # process_update() requires Application.initialize(), but the real thing
+    # calls Bot.get_me() over the network for a fake token. We only need
+    # dispatch (routing an update to the right handlers), not bot identity,
+    # so mark it initialized directly rather than hitting the network.
+    app._initialized = True
+
+    user = User(id=100, first_name="Test", is_bot=False, username="alice")
+    chat = Chat(id=100, type="private")
+    message = Message(message_id=1, date=_datetime.now(), chat=chat, from_user=user,
+                       text="not a command, not R1C1, just plain text")
+    update = Update(update_id=1, message=message)
+
+    _asyncio.run(app.process_update(update))
+
+    bingo_mock.assert_awaited()
+    provisioning_mock.assert_awaited()
 
 
 # --- confirm_button -> pass -> claim + announce + DM ------------------------
@@ -338,9 +620,25 @@ def test_award_at_limit_cancels_outstanding_timeouts(bingo, store, monkeypatch):
     job.schedule_removal.assert_called_once()
 
 
-# --- register wires the four handlers --------------------------------------
+# --- register wires the handlers --------------------------------------
 
 def test_register_adds_handlers(bingo):
     app = MagicMock()
     bingo.register(app)
-    assert app.add_handler.call_count >= 4
+    assert app.add_handler.call_count >= 7
+    ocr_confirm_calls = [
+        c for c in app.add_handler.call_args_list
+        if c.args and getattr(c.args[0], "callback", None) is bingo.bingo_ocr_confirm_button
+    ]
+    assert ocr_confirm_calls, "bingo_ocr_confirm_button handler was not registered"
+    # the text-submission handler MUST be in group=1, not the default group,
+    # or it will shadow handlers/provisioning.py's identically-filtered
+    # awaiting_email MessageHandler (see the dedicated regression test above)
+    text_handler_calls = [
+        c for c in app.add_handler.call_args_list
+        if c.args and getattr(c.args[0], "callback", None) is bingo.on_bingo_text
+    ]
+    assert text_handler_calls, "on_bingo_text handler was not registered"
+    call = text_handler_calls[0]
+    group = call.kwargs.get("group", call.args[1] if len(call.args) > 1 else 0)
+    assert group == 1
