@@ -12,7 +12,7 @@ with a Yes/No "does this look right?" keyboard (bingo_ocr_confirm_button).
 Yes proceeds with the original read; No re-arms awaiting_bingo_text with that
 same prefilled list so the player corrects it as plain text instead of
 re-photographing the card. From there (confirmed OCR or a from-scratch/edited
-text submission): corner-number wrong-sheet reject; winning_lines ->
+text submission): winning_lines ->
 pick_best_line; record submission + winning_members; DM each reachable,
 non-self, non-cached subject a Yes/No inline keyboard, reusing cached
 confirmations, and arm a config.BINGO_CONFIRM_TIMEOUT job; confirm_button
@@ -403,24 +403,10 @@ async def on_bingo_text(update, context):
 
 async def _process_read(update, context, uid, handle, sheet_no, read):
     """Shared tail for both submission modes: takes read_submission()'s (or
-    bingo_text.parse_submission()'s) {"corner", "cells"} shape and does the
-    wrong-sheet check, line detection, recording, and subject DMs."""
-    # wrong-sheet defence: a confident, mismatched corner number rejects.
-    # Always None for text submissions, so this is a no-op there -- there's
-    # no spoofing risk anyway since _matched_and_prompts always pulls prompts
-    # from the caller's own server-side sheet_no, never client input.
-    corner = read.get("corner")
-    if corner is not None and corner != sheet_no:
-        # Record the attempt (so the retry cooldown still applies) but resolve it
-        # immediately — leaving it 'pending' would block the user's next submit.
-        rejected = storage.start_bingo_submission(uid, handle, sheet_no, corner)
-        storage.set_submission_status(rejected, "rejected")
-        await update.effective_message.reply_text(
-            f"This looks like sheet #{corner}, but you were given sheet "
-            f"#{sheet_no}. Please send your own card 🙂"
-        )
-        return
-
+    bingo_text.parse_submission()'s) {"cells"} shape and does line detection,
+    recording, and subject DMs. (The printed sheet number is an OCR-unreadable
+    pixel font, so there's no corner-based wrong-sheet check -- verification
+    leans entirely on per-person confirmation.)"""
     matched, prompts = _matched_and_prompts(read.get("cells", []), handle, sheet_no)
 
     candidate_lines = lines.winning_lines(matched, handle)
@@ -432,7 +418,7 @@ async def _process_read(update, context, uid, handle, sheet_no, read):
         return
 
     line = lines.pick_best_line(candidate_lines)
-    submission_id = storage.start_bingo_submission(uid, handle, sheet_no, corner)
+    submission_id = storage.start_bingo_submission(uid, handle, sheet_no)
 
     members = []
     for (r, c, h) in line:

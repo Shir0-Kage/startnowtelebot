@@ -294,7 +294,7 @@ def test_ocr_confirm_yes_records_line_and_dms_subjects(bingo, store, monkeypatch
 
     # OCR returns a full top-row line of 4 distinct, non-self, confident handles
     def fake_read(sheet_no, image_bytes, index):
-        return {"corner": sheet_no, "cells": [
+        return {"cells": [
             {"row": 0, "col": 0, "handle": "bob", "score": 95.0},
             {"row": 0, "col": 1, "handle": "cara", "score": 95.0},
             {"row": 0, "col": 3, "handle": "dan", "score": 95.0},
@@ -357,7 +357,7 @@ def test_ocr_confirm_no_arms_text_mode_with_prefilled_list(bingo, store, monkeyp
 def test_ocr_confirm_yes_no_line_reports_and_no_submission(bingo, store, monkeypatch):
     store.allocate_bingo_sheet(100, "alice")
     monkeypatch.setattr(bingo.ocr, "read_submission",
-                        lambda s, b, i: {"corner": s, "cells": []})
+                        lambda s, b, i: {"cells": []})
     monkeypatch.setattr(bingo.lines, "winning_lines", lambda matched, sub: [])
     ctx = _context()
     ctx.user_data["awaiting_bingo"] = True
@@ -371,28 +371,6 @@ def test_ocr_confirm_yes_no_line_reports_and_no_submission(bingo, store, monkeyp
 
     assert store.active_submission(100) is None  # nothing pending
     q.message.reply_text.assert_awaited()  # "no bingo yet" message
-
-
-def test_ocr_confirm_yes_wrong_sheet_does_not_strand_pending(bingo, store, monkeypatch):
-    # A mismatched corner number must be REJECTED without leaving a 'pending'
-    # row (which would lock the user out of /submit_bingo forever).
-    store.allocate_bingo_sheet(100, "alice")
-    sheet = store.get_bingo_sheet(100)
-    wrong = (sheet % 15) + 1
-    monkeypatch.setattr(bingo.ocr, "read_submission",
-                        lambda s, b, i: {"corner": wrong, "cells": []})
-    ctx = _context()
-    ctx.user_data["awaiting_bingo"] = True
-    tg_file = AsyncMock()
-    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"img"))
-    ctx.bot.get_file = AsyncMock(return_value=tg_file)
-    upd = _photo_update(100, "alice")
-    asyncio.run(bingo.on_bingo_image(upd, ctx))
-
-    q = _tap_ocr_confirm(bingo, ctx, 100, "yes")
-
-    q.message.reply_text.assert_awaited()                  # rejection message
-    assert store.active_submission(100) is None             # NOT stranded pending
 
 
 def test_ocr_confirm_stale_button_is_a_no_op(bingo, store):

@@ -1,8 +1,11 @@
 """OCR + fuzzy handle matching for the Human Bingo submissions.
 
 Given a filled bingo sheet (png/jpg bytes) and the sheet number the player was
-allocated, crop each of the 24 non-free cells from the known template geometry,
-OCR the handwritten/typed handle, and fuzzy-match it against the closed roster.
+allocated, OCR the whole sheet in a single pass, fuzzy-match each detected text
+box against the closed roster, and attribute every confident handle to the cell
+whose centre it sits *nearest*. Nearest-box (rather than a fixed per-cell crop)
+tolerates handles that overhang a cell edge or float in the gutter between
+cells, which is how players actually place their name tags.
 
 Design goals (see the spec): a bad OCR read degrades to an *empty* cell (the
 line just doesn't count) and never to matching the wrong person. The engine is
@@ -14,7 +17,7 @@ import io
 import logging
 import re
 
-from PIL import Image, ImageOps, ImageStat
+from PIL import Image, ImageOps
 
 from config import BINGO_MATCH_MARGIN, BINGO_MATCH_THRESHOLD
 from data import bingo_templates as bt
@@ -41,18 +44,15 @@ def _engine():
     return _ENGINE
 
 
-def _ocr_text(eng, image):
-    """Run *eng* (a RapidOCR-compatible callable) on a PIL image.
+def _encode(pil_img):
+    """PNG-encode a PIL image to bytes for the OCR engine.
 
-    Returns the concatenated text (may be '').  The caller obtains *eng* once
-    via _engine() so we share the stateful singleton across all crops in a
-    single submission; tests monkeypatch _engine() with a scripted fake.
+    RapidOCR's callable accepts str/Path/bytes/ndarray but NOT a PIL image on
+    recent (<2) versions, so we hand it bytes — the one form every version reads.
     """
-    result, _elapse = eng(image)
-    if not result:
-        return ""
-    # result is a list of [box, text, confidence]; join text fragments.
-    return " ".join(str(line[1]) for line in result if len(line) > 1 and line[1])
+    buf = io.BytesIO()
+    pil_img.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # --- Handle normalisation (looser than setup.sheets.normalize_handle) ------
@@ -264,84 +264,113 @@ def match_handle(text, index):
 
 
 # --- Image helpers ---------------------------------------------------------
-_REF_WIDTH = 1000       # normalize every upload to this width before cropping
-_INSET = 0.08           # trim 8% off each side of a cell to drop prompt/gridlines
-_UPSCALE = 3            # LANCZOS upscaling factor for the cropped cell
-_DARK_MEAN = 110        # crops darker than this get inverted to dark-on-light
+_DETECT_WIDTH = 1600    # normalize the whole sheet to this width for the OCR pass
 
 
-def _load_image(image_bytes):
+def _load_image(image_bytes, ref_width=_DETECT_WIDTH):
     im = Image.open(io.BytesIO(image_bytes))
     im = ImageOps.exif_transpose(im)          # fix phone rotation
     im = im.convert("RGB")
     w, h = im.size
-    if w != _REF_WIDTH and w > 0:
-        scale = _REF_WIDTH / w
-        im = im.resize((_REF_WIDTH, max(1, int(h * scale))), Image.LANCZOS)
+    if w != ref_width and w > 0:
+        scale = ref_width / w
+        im = im.resize((ref_width, max(1, int(h * scale))), Image.LANCZOS)
     return im
 
 
-def _crop_box(im, frac):
-    """Crop a fractional (x0,y0,x1,y1) box with an inward inset, upscaled."""
-    w, h = im.size
-    x0, y0, x1, y1 = frac
-    bw, bh = (x1 - x0), (y1 - y0)
-    x0 += bw * _INSET
-    x1 -= bw * _INSET
-    y0 += bh * _INSET
-    y1 -= bh * _INSET
-    box = (int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h))
-    crop = im.crop(box)
-    if crop.width and crop.height:
-        crop = crop.resize(
-            (crop.width * _UPSCALE, crop.height * _UPSCALE), Image.LANCZOS
-        )
-    return crop
+# --- Nearest-box attribution ----------------------------------------------
+def _cell_centres():
+    """Fractional (cx, cy) centre of every non-free cell, keyed by (row, col)."""
+    centres = {}
+    for (r, c), (x0, y0, x1, y1) in bt.CELL_BOXES.items():
+        if bt.is_free(r, c):
+            continue
+        centres[(r, c)] = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+    return centres
 
 
-def _prep_for_ocr(crop):
-    """Grayscale, contrast-boost, invert-if-dark. Returns a PIL image."""
-    g = ImageOps.grayscale(crop)
-    g = ImageOps.autocontrast(g)
-    if ImageStat.Stat(g).mean[0] < _DARK_MEAN:
-        g = ImageOps.invert(g)
-    return g.convert("RGB")
+def _grid_bounds():
+    """Fractional (x_min, y_min, x_max, y_max) of the whole grid, padded by half
+    a cell, so detections well outside the 5x5 grid (title banner, footer, the
+    corner number) are ignored instead of snapping to an edge cell."""
+    boxes = bt.CELL_BOXES.values()
+    pad_x, pad_y = bt.CELL_W_F * 0.5, bt.CELL_H_F * 0.5
+    return (min(b[0] for b in boxes) - pad_x, min(b[1] for b in boxes) - pad_y,
+            max(b[2] for b in boxes) + pad_x, max(b[3] for b in boxes) + pad_y)
+
+
+def _nearest_cell(fx, fy, centres):
+    """(row, col) of the cell whose centre is nearest the fractional point,
+    measured in cell-step units so the different x/y scales don't skew it."""
+    step_x, step_y = bt.CELL_W_F + bt.GUTTER_F, bt.CELL_H_F + bt.GUTTER_F
+    best, best_d = None, None
+    for rc, (cx, cy) in centres.items():
+        dx, dy = (fx - cx) / step_x, (fy - cy) / step_y
+        d = dx * dx + dy * dy
+        if best_d is None or d < best_d:
+            best_d, best = d, rc
+    return best
+
+
+def _detections(eng, image):
+    """OCR the whole image once; yield (fx, fy, text) per detected box, where
+    (fx, fy) is the box centroid as a fraction of the image size."""
+    w, h = image.size
+    result, _elapse = eng(_encode(image))
+    out = []
+    for line in (result or []):
+        if len(line) < 2 or not line[1]:
+            continue
+        box, text = line[0], line[1]
+        try:
+            xs = [p[0] for p in box]
+            ys = [p[1] for p in box]
+        except (TypeError, IndexError):
+            continue
+        if not xs or not ys or w <= 0 or h <= 0:
+            continue
+        out.append(((sum(xs) / len(xs)) / w, (sum(ys) / len(ys)) / h, str(text)))
+    return out
 
 
 # --- Public pipeline -------------------------------------------------------
 def read_submission(sheet_no, image_bytes, index):
-    """OCR one filled sheet. Returns:
-        {"corner": int|None,
-         "cells": [{"row":int,"col":int,"handle":str|None,"score":float}, ...]}
-    with exactly 24 cell dicts (the FREE centre is skipped).
+    """OCR one filled sheet and attribute each handle to its NEAREST cell.
+
+    Returns:
+        {"cells": [{"row":int,"col":int,"handle":str|None,"score":float}, ...]}
+    with exactly 24 cell dicts (the FREE centre is skipped). sheet_no is accepted
+    for API symmetry but unused: the printed sheet number is a decorative pixel-
+    outline font OCR can't read, so the wrong-sheet check was dropped in favour of
+    the per-person confirmation flow.
+
+    The whole sheet is OCR'd in a single pass; each detected text box is fuzzy-
+    matched to the roster and, if it's a confident handle, assigned to the cell
+    whose centre it sits nearest (when two land on one cell, the higher score
+    wins). This tolerates handles that overhang a cell edge or float in the
+    gutter, which a fixed per-cell crop could not.
 
     The OCR engine is obtained once per call so a monkeypatched _engine() that
-    returns a scripted fake stays in sync across all 25 crops (24 cells + corner).
+    returns a scripted fake stays in sync.
     """
     im = _load_image(image_bytes)
     eng = _engine()     # acquire once; tests replace this with a scripted fake
 
-    cells = []
-    for row in range(bt.GRID):
-        for col in range(bt.GRID):
-            if bt.is_free(row, col):
-                continue
-            frac = bt.CELL_BOXES[(row, col)]
-            crop = _prep_for_ocr(_crop_box(im, frac))
-            text = _ocr_text(eng, crop)
-            handle, score = match_handle(text, index)
-            cells.append(
-                {"row": row, "col": col, "handle": handle, "score": score}
-            )
+    centres = _cell_centres()
+    x_min, y_min, x_max, y_max = _grid_bounds()
+    cells = {rc: {"row": rc[0], "col": rc[1], "handle": None, "score": 0.0}
+             for rc in centres}
 
-    corner_crop = _prep_for_ocr(_crop_box(im, bt.CORNER_BOX))
-    corner_text = _ocr_text(eng, corner_crop)
-    corner = _read_int(corner_text)
+    for fx, fy, text in _detections(eng, im):
+        if not (x_min <= fx <= x_max and y_min <= fy <= y_max):
+            continue  # outside the grid: banner, footer, corner number, etc.
+        handle, score = match_handle(text, index)
+        if not handle:
+            continue
+        rc = _nearest_cell(fx, fy, centres)
+        if rc is not None and score > cells[rc]["score"]:
+            cells[rc]["handle"], cells[rc]["score"] = handle, score
 
-    return {"corner": corner, "cells": cells}
-
-
-def _read_int(text):
-    """First run of digits in the OCR text as an int, else None."""
-    m = re.search(r"\d+", text or "")
-    return int(m.group()) if m else None
+    return {"cells": [cells[(r, c)]
+                      for r in range(bt.GRID) for c in range(bt.GRID)
+                      if not bt.is_free(r, c)]}

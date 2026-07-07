@@ -22,6 +22,10 @@ setup/*_cache.csv
 # local image asset dropped in for set_group_photo.py
 setup/group_photo.*
 
+# runtime logs + freeze diagnostics
+bot.log*
+freeze_dumps.log
+
 # python
 __pycache__/
 *.py[cod]
