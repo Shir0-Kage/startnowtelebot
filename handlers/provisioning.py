@@ -15,7 +15,7 @@ from telegram.ext import CommandHandler, MessageHandler, filters
 
 import storage
 from setup import manifest, sheets
-from utils.auth import facil_only
+from utils.auth import facil_only, is_admin
 
 log = logging.getLogger(__name__)
 
@@ -327,11 +327,30 @@ async def sync_year_ones(update, context):
     await update.effective_message.reply_text(msg)
 
 
+def _facil_ogs(update):
+    """OGs a (non-admin) facil is allowed to inspect: their roster OG, plus the OG
+    of the group chat they're running the command in."""
+    ogs = set()
+    user = update.effective_user
+    if user is not None:
+        og = _og_by_facil_handle(user.username)
+        if og:
+            ogs.add(og)
+    chat = update.effective_chat
+    if chat is not None and chat.type in ("group", "supergroup"):
+        og = _og_from_title(chat.title)
+        if og:
+            ogs.add(og)
+    return ogs
+
+
 @facil_only
 async def roster_status(update, context):
     """Show, per Year 1 in an OG, whether they've reached the bot and been placed
     — so a facil can see exactly who's missing and why. Usage: /roster_status PM1
-    (or just run it inside the OG's group chat)."""
+    (or just run it inside the OG's group chat). Admins may check any OG; a facil
+    may only check their own group."""
+    await ensure_rosters_loaded()  # off the loop; needed for the facil-OG check
     if context.args:
         og = sheets.og_code(context.args[0])
     else:
@@ -342,6 +361,16 @@ async def roster_status(update, context):
             "Usage: /roster_status <OG> — e.g. /roster_status PM1"
         )
         return
+
+    # admins see any OG; facils are scoped to their own group
+    if not is_admin(update.effective_user):
+        allowed = _facil_ogs(update)
+        if og not in allowed:
+            own = ", ".join(sorted(allowed)) if allowed else "your own group"
+            await update.effective_message.reply_text(
+                f"You can only check {own}. Ask an admin for other OGs 🙏"
+            )
+            return
 
     members = (await asyncio.to_thread(sheets.load_year1_members)).get(og, [])
     if not members:
@@ -361,14 +390,16 @@ async def roster_status(update, context):
     for m in members:
         name = m.get("name") or "?"
         handle = m.get("handle")
+        email = (m.get("email") or "?").lower()
         if not handle:
             bad += 1
-            rows.append(f"⚠️ {name} — unusable handle '{m.get('raw_handle') or '(blank)'}'")
+            rows.append(f"⚠️ {name} — unusable handle '{m.get('raw_handle') or '(blank)'}' — email: {email}")
             continue
         uid = started.get(handle)
         if uid is None:
             missing += 1
-            rows.append(f"❌ {name} (@{handle}) — hasn't /started, or their real @username differs from the sheet")
+            rows.append(f"❌ {name} (@{handle}) — hasn't /started, or their real @username "
+                        f"differs from the sheet — email: {email}")
         elif storage.link_sent_to(uid):
             in_group += 1
             rows.append(f"✅ {name} (@{handle}) — in the group")

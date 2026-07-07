@@ -6,34 +6,50 @@ from unittest.mock import AsyncMock, MagicMock
 from handlers import provisioning as prov
 
 
-def test_roster_status_categorizes_each_year_one(monkeypatch):
+def _roster_env(monkeypatch):
     monkeypatch.setattr(prov.sheets, "load_year1_members", lambda: {"PM1": [
         {"name": "Ansel", "handle": "camembertcheese", "raw_handle": "camembertcheese", "email": "a@x"},
         {"name": "Benaiah", "handle": "beani_boi", "raw_handle": "@beani_boi", "email": "b@x"},
-        {"name": "Kairos", "handle": "caerustay", "raw_handle": "@caerustay", "email": "c@x"},
-        {"name": "Broken", "handle": None, "raw_handle": "@no name", "email": "d@x"},
+        {"name": "Kairos", "handle": "caerustay", "raw_handle": "@caerustay", "email": "KAIROS@u.nus.edu"},
+        {"name": "Broken", "handle": None, "raw_handle": "@no name", "email": "brk@u.nus.edu"},
     ]})
-    # Ansel started + placed; Benaiah started but not placed; Kairos never started
     monkeypatch.setattr(prov.storage, "get_started", lambda: [
-        {"user_id": 1, "username": "camembertcheese"},
-        {"user_id": 2, "username": "beani_boi"},
+        {"user_id": 1, "username": "camembertcheese"},   # started + placed
+        {"user_id": 2, "username": "beani_boi"},          # started, waiting
     ])
     monkeypatch.setattr(prov.storage, "link_sent_to", lambda uid: uid == 1)
-    monkeypatch.setattr("utils.auth.is_facilitator", AsyncMock(return_value=True))
+    monkeypatch.setattr("utils.auth.is_facilitator", AsyncMock(return_value=True))  # pass facil_only
+    monkeypatch.setattr(prov, "ensure_rosters_loaded", AsyncMock())                 # skip real loads
 
+
+def _run_roster(og):
     upd = MagicMock()
     upd.effective_message.reply_text = AsyncMock()
+    upd.effective_chat.type = "private"
     ctx = MagicMock()
-    ctx.args = ["pm1"]
+    ctx.args = [og]
     ctx.bot = AsyncMock()
-
     asyncio.run(prov.roster_status(upd, ctx))
-    r = upd.effective_message.reply_text.await_args.args[0]
+    return upd.effective_message.reply_text.await_args.args[0]
+
+
+def test_roster_status_admin_sees_breakdown_with_emails(monkeypatch):
+    _roster_env(monkeypatch)
+    monkeypatch.setattr(prov, "is_admin", lambda u: True)   # admin -> any OG
+    r = _run_roster("pm1")
     assert "1 in group" in r and "1 waiting" in r and "1 not reachable" in r and "1 bad handle" in r
-    assert "✅ Ansel" in r          # started + placed
-    assert "⏳ Benaiah" in r        # started, waiting
-    assert "❌ Kairos" in r         # not reachable
-    assert "⚠️ Broken" in r         # bad handle
+    assert "✅ Ansel" in r and "⏳ Benaiah" in r
+    assert "❌ Kairos" in r and "kairos@u.nus.edu" in r     # email shown for the unreachable one
+    assert "⚠️ Broken" in r and "brk@u.nus.edu" in r        # and the bad-handle one
+
+
+def test_roster_status_facil_scoped_to_own_group(monkeypatch):
+    _roster_env(monkeypatch)
+    monkeypatch.setattr(prov, "is_admin", lambda u: False)              # a facil, not an admin
+    monkeypatch.setattr(prov, "_og_by_facil_handle", lambda username: "PM1")  # their OG is PM1
+    assert "✅ Ansel" in _run_roster("pm1")                 # own group -> allowed
+    denied = _run_roster("pm5")                            # someone else's group -> blocked
+    assert "only check" in denied.lower() and "PM1" in denied
 
 
 def test_sync_flags_unusable_and_cleaned_handles(monkeypatch):
