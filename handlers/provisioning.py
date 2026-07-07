@@ -328,37 +328,30 @@ async def sync_year_ones(update, context):
 
 
 def _facil_ogs(update):
-    """OGs a (non-admin) facil is allowed to inspect: their roster OG, plus the OG
-    of the group chat they're running the command in."""
-    ogs = set()
+    """OG(s) a (non-admin) facil may inspect — their own, from the facil roster."""
     user = update.effective_user
-    if user is not None:
-        og = _og_by_facil_handle(user.username)
-        if og:
-            ogs.add(og)
-    chat = update.effective_chat
-    if chat is not None and chat.type in ("group", "supergroup"):
-        og = _og_from_title(chat.title)
-        if og:
-            ogs.add(og)
-    return ogs
+    og = _og_by_facil_handle(user.username) if user is not None else None
+    return {og} if og else set()
 
 
 @facil_only
 async def roster_status(update, context):
-    """Show, per Year 1 in an OG, whether they've reached the bot and been placed
-    — so a facil can see exactly who's missing and why. Usage: /roster_status PM1
-    (or just run it inside the OG's group chat). Admins may check any OG; a facil
-    may only check their own group."""
+    """DM-ONLY (student privacy): show, per Year 1 in an OG, whether they've reached
+    the bot and been placed. Usage: /roster_status PM1 (in a private chat with the
+    bot). Admins may check any OG; a facil may only check their own group."""
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        await update.effective_message.reply_text(
+            "For students' privacy I only share this in a private chat — DM me "
+            "/roster_status <OG> (e.g. /roster_status PM1) instead 🙏"
+        )
+        return
+
     await ensure_rosters_loaded()  # off the loop; needed for the facil-OG check
-    if context.args:
-        og = sheets.og_code(context.args[0])
-    else:
-        chat = update.effective_chat
-        og = _og_from_title(chat.title) if chat and chat.type in ("group", "supergroup") else None
+    og = sheets.og_code(context.args[0]) if context.args else None
     if not og:
         await update.effective_message.reply_text(
-            "Usage: /roster_status <OG> — e.g. /roster_status PM1"
+            "Usage (DM me): /roster_status <OG> — e.g. /roster_status PM1"
         )
         return
 

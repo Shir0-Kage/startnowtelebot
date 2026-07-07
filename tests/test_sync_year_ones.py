@@ -52,6 +52,21 @@ def test_roster_status_facil_scoped_to_own_group(monkeypatch):
     assert "only check" in denied.lower() and "PM1" in denied
 
 
+def test_roster_status_refused_in_group_for_privacy(monkeypatch):
+    _roster_env(monkeypatch)
+    monkeypatch.setattr(prov, "is_admin", lambda u: True)   # even an admin can't in-group
+    upd = MagicMock()
+    upd.effective_message.reply_text = AsyncMock()
+    upd.effective_chat.type = "supergroup"                 # a group, not a DM
+    ctx = MagicMock()
+    ctx.args = ["pm1"]
+    ctx.bot = AsyncMock()
+    asyncio.run(prov.roster_status(upd, ctx))
+    r = upd.effective_message.reply_text.await_args.args[0]
+    assert "private" in r.lower()
+    assert "Ansel" not in r and "email" not in r.lower()   # no roster leaked to the group
+
+
 def test_sync_flags_unusable_and_cleaned_handles(monkeypatch):
     monkeypatch.setattr(prov.sheets, "load_year1_members", lambda: {
         "AM4": [
