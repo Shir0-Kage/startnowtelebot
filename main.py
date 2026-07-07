@@ -5,7 +5,9 @@ Make sure BOT_TOKEN is set first (see the README).
 """
 
 import logging
+import os
 import sys
+from logging.handlers import RotatingFileHandler
 
 from telegram import BotCommand, Update
 from telegram.ext import Application, Defaults
@@ -23,15 +25,30 @@ from handlers import (
     schedule,
     settings,
 )
+from utils import watchdog
 
+# Log to stdout AND a rotating file, so logs survive across restarts (the bot
+# runs under a restart loop) and a freeze leaves a trail on disk.
+_handlers = [logging.StreamHandler(sys.stdout)]
+try:
+    _handlers.append(RotatingFileHandler(
+        os.environ.get("LOG_FILE", "bot.log"),
+        maxBytes=5_000_000, backupCount=3, encoding="utf-8"))
+except Exception:
+    pass  # read-only FS etc. — stdout still works
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     level=logging.INFO,
+    handlers=_handlers,
 )
 # httpx is noisy at INFO — quiet it down a notch
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 log = logging.getLogger("startnow")
+
+# Freeze diagnostics: arm `kill -USR1 <pid>` stack dumps right away, so even a
+# hang during startup is catchable.
+watchdog.enable_faulthandler()
 
 
 # Commands shown in Telegram's "/" menu. Facil-only ones are left out to keep
@@ -61,6 +78,8 @@ async def _on_startup(app):
     # warm the Year 1 / facil rosters in the background (off the event loop) so
     # the first /start is instant and a slow Google fetch never blocks startup
     app.create_task(provisioning.ensure_rosters_loaded())
+    # heartbeat the loop so the watchdog can tell a real freeze from idleness
+    app.create_task(watchdog.heartbeat())
     log.info("bot is up and running")
 
 
@@ -76,6 +95,13 @@ def main():
         )
 
     storage.init_db()
+
+    # Watchdog: a separate thread that dumps every thread's stack to the freeze
+    # log if the event loop stops ticking for WATCHDOG_STALL_SECONDS — this is
+    # how a hard hang (loop blocked, Ctrl+C dead) gets captured for diagnosis.
+    watchdog.start_watchdog(
+        stall_seconds=int(os.environ.get("WATCHDOG_STALL_SECONDS", "20"))
+    )
 
     app = (
         Application.builder()
