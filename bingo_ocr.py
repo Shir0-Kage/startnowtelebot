@@ -15,6 +15,7 @@ module-level singleton, exactly like the shared storage connection.
 
 import io
 import logging
+import os
 import re
 
 from PIL import Image, ImageOps
@@ -34,13 +35,34 @@ log = logging.getLogger(__name__)
 # so we build it lazily and reuse it. Tests monkeypatch _engine() with a fake,
 # so rapidocr_onnxruntime never needs to be installed to run them.
 _ENGINE = None
+_OCR_THREADS = int(os.environ.get("OCR_THREADS", "2"))
 
 
 def _engine():
     global _ENGINE
     if _ENGINE is None:
-        from rapidocr_onnxruntime import RapidOCR  # lazy: heavy import
-        _ENGINE = RapidOCR()
+        # Cap onnxruntime's thread pools. By default RapidOCR builds each of its
+        # three models with an intra-op pool sized to the CPU count, so on a
+        # many-core host that's dozens-to-hundreds of threads and the session
+        # build holds the GIL while spinning them up. RapidOCR doesn't expose the
+        # knob, so patch SessionOptions for the build. (This module only ever runs
+        # inside the isolated ocr_worker subprocess, so it stays light and can't
+        # affect the bot — but capping keeps the scan fast and CPU-friendly.)
+        import rapidocr_onnxruntime.utils as _ru
+        _orig_so = _ru.SessionOptions
+
+        def _capped_session_options():
+            so = _orig_so()
+            so.intra_op_num_threads = _OCR_THREADS
+            so.inter_op_num_threads = 1
+            return so
+
+        _ru.SessionOptions = _capped_session_options
+        try:
+            from rapidocr_onnxruntime import RapidOCR  # lazy: heavy import
+            _ENGINE = RapidOCR()
+        finally:
+            _ru.SessionOptions = _orig_so
     return _ENGINE
 
 

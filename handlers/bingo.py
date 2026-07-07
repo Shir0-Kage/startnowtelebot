@@ -5,8 +5,8 @@ card so the game can go live ahead of the checker. The /submit_bingo flow (OCR,
 winning-line detection and confirmations) is added on top of this module later.
 
 The full flow: gate on bingo_is_closed / has_bingo_prize / active_submission +
-cooldown; two-step image upload (context.user_data["awaiting_bingo"]); OCR via
-bingo_ocr.read_submission; winning_lines ->
+cooldown; two-step image upload (context.user_data["awaiting_bingo"]); OCR in an
+isolated ocr_worker subprocess (so onnxruntime can't freeze the bot); winning_lines ->
 pick_best_line; record submission + winning_members; DM each reachable,
 non-self, non-cached subject a Yes/No inline keyboard, reusing cached
 confirmations, and arm a config.BINGO_CONFIRM_TIMEOUT job; confirm_button
@@ -16,8 +16,10 @@ subjects count as a miss.
 """
 
 import asyncio
+import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import pathlib
+import sys
 from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,7 +31,6 @@ from telegram.ext import (
 )
 
 import bingo_lines as lines
-import bingo_ocr as ocr
 import config
 import storage
 from data import bingo_templates as templates
@@ -38,33 +39,58 @@ from setup import sheets
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Roster index — used by the submit pipeline to fuzzy-match typed handles
-# against the known Year 1 handles. /get_bingo does NOT gate on the roster:
-# anyone who DMs the bot gets a card, so a Year 1 who's missing from the sheet
-# can still play.
+# OCR runs in an ISOLATED subprocess (ocr_worker.py). RapidOCR/onnxruntime holds
+# the GIL while building its models and spins up a CPU-sized thread pool, which
+# on a busy box can freeze a whole Python process for seconds — so it must NOT
+# run in the bot's process. A subprocess has its own GIL/interpreter; if it hangs
+# we kill it, so the bot's event loop and watchdog can never freeze. This is the
+# freeze guarantee. /get_bingo does NOT gate on the roster: anyone who DMs the
+# bot gets a card and can play; the worker builds the roster index itself.
 # ---------------------------------------------------------------------------
 
-_ROSTER_INDEX = None     # full index dict built by bingo_ocr.build_roster_index
-
-# One dedicated worker thread for the CPU-heavy OCR, so a scan never blocks the
-# bot's event loop and simultaneous submissions queue instead of pegging the CPU.
-_OCR_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bingo-ocr")
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+_OCR_WORKER = str(_REPO_ROOT / "ocr_worker.py")
+_OCR_SEMAPHORE = asyncio.Semaphore(1)   # one scan at a time (bounds subprocesses)
 
 
-def _roster_index():
-    """Build (and cache) the rich roster index that bingo_ocr uses for fuzzy
-    handle matching. Also initialises _ROSTER_INDEX with a 'handles' set so
-    _is_year1 can share the same data when called indirectly."""
-    global _ROSTER_INDEX
-    if _ROSTER_INDEX is None:
-        members = []
+async def _run_ocr(sheet_no, image_bytes):
+    """OCR one card in an isolated subprocess. Returns read_submission's dict, or
+    None on timeout/failure (the caller then asks the player to retry). A hung
+    scan is killed, so the bot always stays responsive."""
+    async with _OCR_SEMAPHORE:
         try:
-            for og_members in sheets.load_year1_members().values():
-                members.extend(og_members)
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, _OCR_WORKER, str(sheet_no),
+                cwd=str(_REPO_ROOT),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
         except Exception as exc:
-            log.warning("couldn't load Year 1 roster for bingo: %s", exc)
-        _ROSTER_INDEX = ocr.build_roster_index(members)
-    return _ROSTER_INDEX
+            log.warning("couldn't start OCR worker: %s", exc)
+            return None
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(input=image_bytes),
+                timeout=config.BINGO_OCR_TIMEOUT.total_seconds(),
+            )
+        except asyncio.TimeoutError:
+            log.warning("OCR worker exceeded the timeout — killing it")
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            return None
+        if proc.returncode != 0 or not out:
+            log.warning("OCR worker failed (rc=%s): %s", proc.returncode,
+                        (err or b"")[:400].decode("utf-8", "replace"))
+            return None
+        try:
+            return json.loads(out.decode("utf-8"))
+        except Exception as exc:
+            log.warning("OCR worker returned unparseable output: %s", exc)
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -265,19 +291,19 @@ async def on_bingo_image(update, context):
         )
         return
 
-    # OCR scans each cell one at a time and can take up to a minute, so let the
-    # player know their card arrived and is being worked on.
+    # OCR can take up to a minute, so let the player know their card arrived.
     await update.effective_message.reply_text(
         "Got your card! 🔍 Scanning it now — this can take up to a minute…"
     )
 
-    # Run the ~minute-long OCR OFF the event loop (onnxruntime releases the GIL
-    # during inference) via the single-worker pool, so the bot stays responsive
-    # and concurrent submissions queue instead of oversubscribing the CPU.
-    read = await asyncio.get_running_loop().run_in_executor(
-        _OCR_POOL,
-        lambda: ocr.read_submission(sheet_no, image_bytes, _roster_index()),
-    )
+    # Scan in an isolated subprocess so onnxruntime can never freeze the bot; a
+    # timeout/kill just asks the player to retry.
+    read = await _run_ocr(sheet_no, image_bytes)
+    if read is None:
+        await update.effective_message.reply_text(
+            "I couldn't finish scanning that in time — please try again in a minute 🙏"
+        )
+        return
 
     matched, prompts = _matched_and_prompts(read.get("cells", []), handle, sheet_no)
 

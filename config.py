@@ -77,6 +77,11 @@ ANNOUNCE_CHAT_ID = int(os.environ.get("ANNOUNCE_CHAT_ID", "-1004292606016"))
 # First 10 winners take a prize; the game closes once the 10th is claimed.
 BINGO_PRIZE_LIMIT = 10
 
+# Hard limit on one card scan. OCR runs in an isolated subprocess; if it exceeds
+# this the bot kills it and asks the player to retry, so a stuck scan can never
+# hang the bot. Generous: a cold worker loads models + fetches the roster first.
+BINGO_OCR_TIMEOUT = timedelta(seconds=int(os.environ.get("BINGO_OCR_TIMEOUT", "180")))
+
 # How long we wait for the people in a winning line to tap Yes/No before the
 # submission is finally evaluated with any still-pending cells counting as misses.
 BINGO_CONFIRM_TIMEOUT = timedelta(hours=12)
