@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings or they break on Linux (bad interpreter).
+*.sh text eol=lf
+# Python is run on Linux; keep it LF too for consistency.
+*.py text eol=lf
