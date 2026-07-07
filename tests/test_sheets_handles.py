@@ -12,6 +12,12 @@ def test_salvages_at_and_spaces():
     assert normalize_handle("BFanL_ok") == "bfanl_ok"      # lowercased
 
 
+def test_handle_without_at_is_equivalent_to_with_at():
+    # a handle typed WITHOUT '@' must be processed exactly like one WITH '@'
+    assert normalize_handle("saraph11a") == normalize_handle("@saraph11a") == "saraph11a"
+    assert normalize_handle("Henry_Bai06") == normalize_handle("@Henry_Bai06") == "henry_bai06"
+
+
 def test_rejects_unsalvageable():
     assert normalize_handle("") is None
     assert normalize_handle(None) is None
