@@ -294,11 +294,37 @@ async def sync_year_ones(update, context):
         else:
             storage.add_waiting(uid, og)
             held += 1
-    await update.effective_message.reply_text(
+
+    # Check layer: surface handles the bot CAN'T match by @username — blank or
+    # malformed (can only get in via the email fallback), and ones we auto-cleaned
+    # (e.g. spaces removed) so a facil can confirm they're the person's real handle.
+    flagged = []
+    try:
+        for og, members in (await asyncio.to_thread(sheets.load_year1_members)).items():
+            for m in members:
+                name = m.get("name") or "?"
+                raw = (m.get("raw_handle") or "").strip()
+                clean = m.get("handle")
+                if clean is None:
+                    flagged.append((og, f"{name} — '{raw or '(blank)'}' can't be matched; "
+                                        "fix the handle or they join via email"))
+                elif re.search(r"\s", raw):
+                    flagged.append((og, f"{name} — '{raw}' → @{clean}; verify it's their real @username"))
+    except Exception as exc:
+        log.warning("couldn't audit Year 1 handles: %s", exc)
+
+    msg = (
         f"Synced from the sheet 🌟\nDM'd {sent} Year 1(s) their join link; "
         f"holding {held} until their facil opens the group. Anyone who hasn't "
         "messaged me yet gets theirs the moment they /start."
     )
+    if flagged:
+        flagged.sort()
+        shown = "\n".join(f"• {og}: {note}" for og, note in flagged[:25])
+        msg += f"\n\n⚠️ {len(flagged)} handle(s) need a look:\n{shown}"
+        if len(flagged) > 25:
+            msg += f"\n…and {len(flagged) - 25} more."
+    await update.effective_message.reply_text(msg)
 
 
 def register(app):

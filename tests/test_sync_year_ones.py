@@ -6,6 +6,31 @@ from unittest.mock import AsyncMock, MagicMock
 from handlers import provisioning as prov
 
 
+def test_sync_flags_unusable_and_cleaned_handles(monkeypatch):
+    monkeypatch.setattr(prov.sheets, "load_year1_members", lambda: {
+        "AM4": [
+            {"name": "Fine", "handle": "finehandle", "raw_handle": "@finehandle", "email": "f@x"},
+            {"name": "Spacey", "handle": "duongle", "raw_handle": "@Duong Le", "email": "d@x"},
+            {"name": "Broken", "handle": None, "raw_handle": "", "email": "b@x"},
+        ],
+    })
+    prov._year1_by_handle = None
+    prov._year1_by_email = None
+    monkeypatch.setattr(prov.storage, "get_started", lambda: [])   # nobody to DM
+    monkeypatch.setattr("utils.auth.is_facilitator", AsyncMock(return_value=True))
+
+    upd = MagicMock()
+    upd.effective_message.reply_text = AsyncMock()
+    ctx = MagicMock()
+    ctx.bot = AsyncMock()
+
+    asyncio.run(prov.sync_year_ones(upd, ctx))
+    reply = upd.effective_message.reply_text.await_args.args[0]
+    assert "Broken" in reply                      # blank handle -> flagged unusable
+    assert "Spacey" in reply and "duongle" in reply  # cleaned -> flagged to verify
+    assert "Fine" not in reply                     # a clean handle is not flagged
+
+
 def test_sync_dms_opened_holds_unopened_skips_others(monkeypatch):
     monkeypatch.setattr(prov.sheets, "load_year1_members", lambda: {
         "AM1": [{"name": "Alice", "handle": "alice", "email": "a@x"}],   # opened
