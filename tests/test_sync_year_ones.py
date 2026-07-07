@@ -6,6 +6,36 @@ from unittest.mock import AsyncMock, MagicMock
 from handlers import provisioning as prov
 
 
+def test_roster_status_categorizes_each_year_one(monkeypatch):
+    monkeypatch.setattr(prov.sheets, "load_year1_members", lambda: {"PM1": [
+        {"name": "Ansel", "handle": "camembertcheese", "raw_handle": "camembertcheese", "email": "a@x"},
+        {"name": "Benaiah", "handle": "beani_boi", "raw_handle": "@beani_boi", "email": "b@x"},
+        {"name": "Kairos", "handle": "caerustay", "raw_handle": "@caerustay", "email": "c@x"},
+        {"name": "Broken", "handle": None, "raw_handle": "@no name", "email": "d@x"},
+    ]})
+    # Ansel started + placed; Benaiah started but not placed; Kairos never started
+    monkeypatch.setattr(prov.storage, "get_started", lambda: [
+        {"user_id": 1, "username": "camembertcheese"},
+        {"user_id": 2, "username": "beani_boi"},
+    ])
+    monkeypatch.setattr(prov.storage, "link_sent_to", lambda uid: uid == 1)
+    monkeypatch.setattr("utils.auth.is_facilitator", AsyncMock(return_value=True))
+
+    upd = MagicMock()
+    upd.effective_message.reply_text = AsyncMock()
+    ctx = MagicMock()
+    ctx.args = ["pm1"]
+    ctx.bot = AsyncMock()
+
+    asyncio.run(prov.roster_status(upd, ctx))
+    r = upd.effective_message.reply_text.await_args.args[0]
+    assert "1 in group" in r and "1 waiting" in r and "1 not reachable" in r and "1 bad handle" in r
+    assert "✅ Ansel" in r          # started + placed
+    assert "⏳ Benaiah" in r        # started, waiting
+    assert "❌ Kairos" in r         # not reachable
+    assert "⚠️ Broken" in r         # bad handle
+
+
 def test_sync_flags_unusable_and_cleaned_handles(monkeypatch):
     monkeypatch.setattr(prov.sheets, "load_year1_members", lambda: {
         "AM4": [

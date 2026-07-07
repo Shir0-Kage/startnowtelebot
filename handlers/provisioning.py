@@ -327,8 +327,64 @@ async def sync_year_ones(update, context):
     await update.effective_message.reply_text(msg)
 
 
+@facil_only
+async def roster_status(update, context):
+    """Show, per Year 1 in an OG, whether they've reached the bot and been placed
+    — so a facil can see exactly who's missing and why. Usage: /roster_status PM1
+    (or just run it inside the OG's group chat)."""
+    if context.args:
+        og = sheets.og_code(context.args[0])
+    else:
+        chat = update.effective_chat
+        og = _og_from_title(chat.title) if chat and chat.type in ("group", "supergroup") else None
+    if not og:
+        await update.effective_message.reply_text(
+            "Usage: /roster_status <OG> — e.g. /roster_status PM1"
+        )
+        return
+
+    members = (await asyncio.to_thread(sheets.load_year1_members)).get(og, [])
+    if not members:
+        await update.effective_message.reply_text(f"No Year 1s are listed for {og} in the sheet.")
+        return
+
+    # started @usernames (normalized) -> user_id, so we can match a sheet handle
+    # to a real person who has messaged the bot
+    started = {}
+    for su in storage.get_started():
+        h = sheets.normalize_handle(su.get("username") or "")
+        if h:
+            started[h] = su["user_id"]
+
+    in_group = waiting = missing = bad = 0
+    rows = []
+    for m in members:
+        name = m.get("name") or "?"
+        handle = m.get("handle")
+        if not handle:
+            bad += 1
+            rows.append(f"⚠️ {name} — unusable handle '{m.get('raw_handle') or '(blank)'}'")
+            continue
+        uid = started.get(handle)
+        if uid is None:
+            missing += 1
+            rows.append(f"❌ {name} (@{handle}) — hasn't /started, or their real @username differs from the sheet")
+        elif storage.link_sent_to(uid):
+            in_group += 1
+            rows.append(f"✅ {name} (@{handle}) — in the group")
+        else:
+            waiting += 1
+            rows.append(f"⏳ {name} (@{handle}) — /started, waiting for the OG to open")
+
+    head = (f"{og} — {len(members)} in the sheet: {in_group} in group, "
+            f"{waiting} waiting, {missing} not reachable"
+            + (f", {bad} bad handle" if bad else ""))
+    await update.effective_message.reply_text(head + "\n\n" + "\n".join(rows))
+
+
 def register(app):
     app.add_handler(CommandHandler("add_year_ones", add_year_ones))
     app.add_handler(CommandHandler("sync_year_ones", sync_year_ones))
+    app.add_handler(CommandHandler("roster_status", roster_status))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
