@@ -1,17 +1,20 @@
-"""Freeze diagnostics: catch a blocked event loop and dump every thread's stack.
+"""Liveness watchdog + freeze diagnostics for the asyncio bot.
 
-When the asyncio loop is blocked by a synchronous call, Ctrl+C is dead and the
-bot logs nothing (the thing that writes logs is the frozen loop). This module
-gives two escape hatches that both work from OUTSIDE the loop:
+When the event loop is blocked by a synchronous call, Ctrl+C is dead and the bot
+logs nothing (the thing that writes logs is the frozen loop). A separate daemon
+thread watches a heartbeat the loop bumps every second and, when the loop stops
+ticking, it:
 
-  * `kill -USR1 <pid>`  -> dump all thread stacks on demand (Unix only).
-  * a WATCHDOG thread   -> auto-dump all thread stacks whenever the loop stops
-                           ticking a heartbeat for `stall_seconds`.
+  1. at `stall_seconds`  — dumps EVERY thread's stack to `freeze_dumps.log` (so
+     we can see exactly which line is blocked), and
+  2. at `restart_seconds`— force-exits the process so the supervisor (the bash
+     restart loop / systemd) relaunches a fresh one, clearing whatever blocked
+     the loop.
 
-`faulthandler.dump_traceback(all_threads=True)` walks every thread's Python
-frames without needing the GIL, so it captures the frozen main thread's stack
-even while it's stuck in a blocking C call (urllib, sqlite, onnxruntime, ...) —
-pointing straight at the offending line.
+You can also dump on demand with `kill -USR1 <pid>` (Unix). Everything here runs
+off the event loop and writes straight to file descriptors (not through the
+`logging` module), so it works even if the main thread froze mid-log or mid-C
+call, and in an unprivileged container where py-spy can't attach.
 """
 
 import asyncio
@@ -41,15 +44,15 @@ def enable_faulthandler(logfile="freeze_dumps.log"):
         _freeze_file = None
     faulthandler.enable()  # dump to stderr on a fatal error (segfault, etc.)
     if hasattr(signal, "SIGUSR1"):
-        target = _freeze_file or sys.stderr
-        faulthandler.register(signal.SIGUSR1, file=target, all_threads=True, chain=False)
+        faulthandler.register(signal.SIGUSR1, file=_freeze_file or sys.stderr,
+                              all_threads=True, chain=False)
         log.info("faulthandler armed: `kill -USR1 %d` dumps all stacks to %s",
                  os.getpid(), logfile)
 
 
 def dump_now(reason):
-    """Dump all thread stacks to the freeze log and stderr. Safe to call from any
-    thread; used by the watchdog and callable manually."""
+    """Dump all thread stacks to the freeze log AND stderr. Safe from any thread
+    and free of the logging module, so it can't deadlock on a log handler lock."""
     header = f"\n===== {datetime.now().isoformat(timespec='seconds')} {reason} " \
              f"(pid {os.getpid()}) — all thread stacks =====\n"
     for target in (_freeze_file, sys.stderr):
@@ -64,6 +67,20 @@ def dump_now(reason):
             pass  # never let diagnostics crash the process
 
 
+def _hard_exit(reason):
+    """Flush diagnostics and terminate NOW. os._exit bypasses the wedged main
+    thread and atexit — a graceful shutdown is impossible when the loop is stuck.
+    The supervisor (restart loop / systemd) then relaunches a fresh process."""
+    for target in (_freeze_file, sys.stderr, sys.stdout):
+        try:
+            target.write(f"[watchdog] {reason}: forcing os._exit(1) so the "
+                         "supervisor restarts the bot\n")
+            target.flush()
+        except Exception:
+            pass
+    os._exit(1)
+
+
 async def heartbeat(interval=1.0):
     """Bump the loop heartbeat on every tick. Schedule once on the event loop
     (e.g. app.create_task(watchdog.heartbeat())). If the loop blocks, this stops
@@ -74,25 +91,29 @@ async def heartbeat(interval=1.0):
         await asyncio.sleep(interval)
 
 
-def start_watchdog(stall_seconds=20):
-    """Start a daemon thread that dumps all stacks when the loop stalls (the
-    heartbeat goes stale) for >= stall_seconds. Dumps once per stall, then re-arms
-    when the loop recovers, so a long freeze doesn't spam the log."""
+def start_watchdog(stall_seconds=20, restart_seconds=60):
+    """Start a daemon thread that watches the loop heartbeat. Dumps all stacks
+    once the loop has stalled >= stall_seconds, and (if restart_seconds > 0)
+    force-restarts the process once the stall reaches restart_seconds. Returns a
+    callable that stops the watchdog (used by tests; main() ignores it)."""
+    stop = threading.Event()
     poll = max(0.25, stall_seconds / 4.0)
 
     def _run():
-        armed = True
-        while True:
-            time.sleep(poll)
+        dumped = False
+        while not stop.wait(poll):
             stalled = time.monotonic() - _beat
-            if stalled >= stall_seconds:
-                if armed:
-                    log.critical("EVENT LOOP STALLED %.0fs — dumping thread stacks "
-                                 "(the loop is blocked by a synchronous call)", stalled)
-                    dump_now(f"EVENT LOOP STALLED {stalled:.0f}s")
-                    armed = False
-            else:
-                armed = True
+            if stalled < stall_seconds:
+                dumped = False
+                continue
+            if not dumped:
+                dump_now(f"EVENT LOOP STALLED {stalled:.0f}s "
+                         "(blocked by a synchronous call)")
+                dumped = True
+            if restart_seconds and stalled >= restart_seconds:
+                _hard_exit(f"EVENT LOOP STALLED {stalled:.0f}s >= {restart_seconds}s")
 
     threading.Thread(target=_run, name="loop-watchdog", daemon=True).start()
-    log.info("loop watchdog started (stall threshold %ds)", stall_seconds)
+    log.info("loop watchdog started (stack dump at %ds; auto-restart at %s)",
+             stall_seconds, f"{restart_seconds}s" if restart_seconds else "off")
+    return stop.set

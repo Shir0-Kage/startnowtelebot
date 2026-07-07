@@ -96,11 +96,15 @@ def main():
 
     storage.init_db()
 
-    # Watchdog: a separate thread that dumps every thread's stack to the freeze
-    # log if the event loop stops ticking for WATCHDOG_STALL_SECONDS — this is
-    # how a hard hang (loop blocked, Ctrl+C dead) gets captured for diagnosis.
+    # Watchdog: a separate thread that watches the loop's heartbeat. If the loop
+    # stops ticking it dumps every thread's stack to the freeze log (at
+    # WATCHDOG_STALL_SECONDS) and then force-restarts the process (at
+    # WATCHDOG_RESTART_SECONDS) so the supervisor relaunches a fresh one — this is
+    # how a hard hang (loop blocked, Ctrl+C dead) gets both diagnosed and healed.
+    # Set WATCHDOG_RESTART_SECONDS=0 to dump only and never auto-restart.
     watchdog.start_watchdog(
-        stall_seconds=int(os.environ.get("WATCHDOG_STALL_SECONDS", "20"))
+        stall_seconds=int(os.environ.get("WATCHDOG_STALL_SECONDS", "20")),
+        restart_seconds=int(os.environ.get("WATCHDOG_RESTART_SECONDS", "60")),
     )
 
     app = (
