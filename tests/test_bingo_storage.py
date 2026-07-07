@@ -19,6 +19,20 @@ def store(tmp_path, monkeypatch):
     return storage
 
 
+# --- connection is configured to not fsync-stall the event loop ----------
+
+def test_init_db_uses_wal_normal_sync_and_short_busy_timeout(store):
+    # WAL + synchronous=NORMAL stops per-commit fsync (which could stall the
+    # event loop for seconds on the overlay FS and freeze the bot); busy_timeout
+    # is capped so a lock conflict degrades to a blip, not a 30s hang.
+    jm = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
+    sync = store._conn.execute("PRAGMA synchronous").fetchone()[0]
+    bt = store._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert jm.lower() == "wal"
+    assert sync == 1          # 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA
+    assert bt == 5000
+
+
 # --- allocation: even + frozen -------------------------------------------
 
 def test_allocation_is_even_over_many_users(store):

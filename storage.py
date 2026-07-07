@@ -160,12 +160,22 @@ CREATE TABLE IF NOT EXISTS bingo_flags (
 
 def init_db():
     global _conn
-    # timeout lets a write wait for the lock instead of erroring — bot.db is
-    # shared by the bot and the setup worker (separate processes).
-    _conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    # timeout: how long a write waits for a busy lock before erroring. Kept short
+    # so a lock conflict fails fast instead of parking the event-loop thread.
+    _conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     _conn.row_factory = sqlite3.Row
     _conn.execute("PRAGMA journal_mode=WAL")
-    _conn.execute("PRAGMA busy_timeout=30000")
+    # synchronous=NORMAL: every storage write runs synchronously on the asyncio
+    # event loop, and the default (FULL) fsyncs on EVERY commit. bot.db sits on a
+    # busy Docker overlay filesystem where an fsync can stall for seconds — which
+    # blocks the loop thread and freezes the whole bot (Ctrl+C dead). In WAL mode
+    # NORMAL is crash-safe (at worst the last transaction is lost on an OS/power
+    # crash — never corruption) and turns a commit into a fast buffered write, so
+    # a storage call no longer stalls the loop. This is the fix for the hang.
+    _conn.execute("PRAGMA synchronous=NORMAL")
+    # cap any writer-lock wait at 5s instead of 30s (defence if a 2nd process
+    # ever opens bot.db) so a collision degrades to a blip, not a long freeze.
+    _conn.execute("PRAGMA busy_timeout=5000")
     with _lock:
         _conn.executescript(SCHEMA)
         # migrate older DBs created before the 'answer' column existed
