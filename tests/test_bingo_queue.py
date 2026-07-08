@@ -1,8 +1,19 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 import bingo_lines
 from handlers import bingo_queue
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending_read():
+    """_PENDING_READ is a module-global dict; a test that fails an assertion
+    mid-way can leak its entries into later tests. Clear it after every test so
+    each starts from a clean slate (makes the manual .pop() calls redundant)."""
+    yield
+    bingo_queue._PENDING_READ.clear()
 
 
 def _cells(matched):
@@ -183,6 +194,27 @@ def test_confirm_button_ignored_when_not_confirming(monkeypatch):
     upd = MagicMock(); upd.callback_query = q
     asyncio.run(bingo_queue.confirm_button(upd, _ctx()))
     assert bingo_queue._start_verification.await_count == 0
+
+
+def test_confirm_button_dms_resend_when_pending_read_lost(monkeypatch):
+    # FIX D: _PENDING_READ is in-memory and empty after a restart. A confirming
+    # submitter who taps Confirm must be asked to resend (not silently ignored),
+    # and we must NOT start verification off a phantom (missing) read.
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    sid = fake.queue_submission(1, "submitter", 1)
+    fake.set_submission_status(sid, "confirming")
+    # deliberately NO bingo_queue._PENDING_READ[sid] -- simulates a restart
+    monkeypatch.setattr(bingo_queue, "_start_verification", AsyncMock())
+    q = AsyncMock(); q.data = f"bingoq:confirm:{sid}"; q.from_user = MagicMock(id=1)
+    upd = MagicMock(); upd.callback_query = q
+    ctx = _ctx()
+    asyncio.run(bingo_queue.confirm_button(upd, ctx))
+    assert bingo_queue._start_verification.await_count == 0   # no phantom verify
+    ctx.bot.send_message.assert_awaited()                     # not a silent no-op
+    dm = ctx.bot.send_message.await_args
+    assert dm.kwargs["chat_id"] == 1
+    assert "resend" in dm.kwargs["text"].lower()
 
 
 def test_on_resend_routes_by_recognition(monkeypatch):

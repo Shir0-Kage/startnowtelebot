@@ -491,7 +491,42 @@ def test_on_bingo_text_exact_match_miss_degrades_gracefully(bingo, store, monkey
     confirming = store.confirming_submissions()
     assert len(confirming) == 1 and confirming[0]["submitter_user_id"] == 100
     assert store.active_submission(100) is None
-    ctx.bot.send_message.assert_awaited()  # the full fill-in template
+    # the submitter's DM is the NOT-fully-recognised FULL fill-in template: it
+    # carries the R1C1 template line and has NO confirm button (unlike the short
+    # "tap Confirm" DM sent when a line IS fully recognised).
+    to_submitter = [c for c in ctx.bot.send_message.await_args_list
+                    if c.kwargs.get("chat_id") == 100]
+    assert any("R1C1" in c.kwargs.get("text", "")
+               and c.kwargs.get("reply_markup") is None
+               for c in to_submitter), "expected the full fill-in template DM"
+
+
+def test_on_bingo_text_fresh_submit_regates_active_submission(bingo, store, monkeypatch):
+    # FIX A: the fresh text-submit branch must re-apply the FULL submit gate
+    # (closed / already-won / already-being-verified / no-sheet), same as the
+    # photo path -- not just the closed check. A user who already has an ACTIVE
+    # ('pending') submission being verified, but whose awaiting_bingo_text flag
+    # was armed earlier (before that submission existed), must be GATED: no new
+    # 'queued' duplicate may slip through.
+    store.allocate_bingo_sheet(100, "alice")
+    store.start_bingo_submission(100, "alice", store.get_bingo_sheet(100))
+    # neutralise the retry cooldown so the GATE is unambiguously what blocks:
+    # before the fix nothing would, and a duplicate 'queued' row is created.
+    monkeypatch.setattr(store, "last_bingo_activity", lambda uid: None)
+    ctx = _context()
+    ctx.user_data["awaiting_bingo_text"] = True
+    upd = _text_update(100, "alice", "R1C1: p - @bob")
+    asyncio.run(bingo.on_bingo_text(upd, ctx))
+    # no NEW submission created -- the duplicate was gated. (Before the fix
+    # enqueue ran and maybe_kickoff promoted the fresh row straight to
+    # 'confirming', so check that queue too, not just 'queued'.)
+    assert store.queued_in_order() == []
+    assert store.confirming_submissions() == []
+    # and the submitter was told their card is already being checked
+    upd.effective_message.reply_text.assert_awaited()
+    replied = " ".join(str(c.args[0]) for c in
+                       upd.effective_message.reply_text.await_args_list if c.args)
+    assert "being checked" in replied
 
 
 def test_on_bingo_text_ignores_when_flag_not_set(bingo, store):

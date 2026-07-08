@@ -58,7 +58,17 @@ async def _send_confirmation(context, sub):
     uid = sub["submitter_user_id"]
     pending = _PENDING_READ.get(sid)
     if pending is None:
+        # in-memory read lost (e.g. restart between kickoff and confirm): ask the
+        # submitter to resend so we can rebuild it, instead of leaving them with
+        # no confirmation message at all.
         log.warning("no pending read for submission %s; can't send confirmation", sid)
+        try:
+            await context.bot.send_message(
+                chat_id=sub["submitter_user_id"],
+                text="Please resend your filled bingo card so I can check it. 🔁",
+            )
+        except Exception:
+            pass
         return
     res = evaluate(pending["read"], pending["handle"], pending["sheet_no"])
     if res["fully_recognised"]:
@@ -128,6 +138,7 @@ async def _confirm_timeout_job(context):
     if storage.submission_status(sid) != "confirming":
         return
     storage.set_submission_status(sid, "failed")
+    _PENDING_READ.pop(sid, None)                   # terminal state: bound growth
     sub = storage.submission_by_id(sid)
     if sub is not None:
         try:
@@ -153,6 +164,18 @@ async def confirm_button(update, context):
         return                                    # stale / already resolved
     pending = _PENDING_READ.get(sid)
     if pending is None:
+        # _PENDING_READ is in-memory and empty after a restart. Rather than
+        # silently no-op'ing the tap, ask the submitter to resend so we can
+        # re-derive and check their card (rearm_confirm_timeouts re-arms the
+        # timeout but can't reconstruct the read).
+        try:
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="I lost track of your card after a restart — please resend "
+                     "your filled list and I'll check it. 🔁",
+            )
+        except Exception:
+            pass
         return
     res = evaluate(pending["read"], pending["handle"], pending["sheet_no"])
     if not res["fully_recognised"]:
@@ -218,6 +241,9 @@ async def _start_verification(context, submission_id, line, handle, sheet_no):
         )
     await bingo._dm_subjects(context, submission_id, members)
     await bingo._finalize(context, submission_id)
+    # handed off to the tagged-people pipeline; the queue no longer needs the
+    # cached read, so evict it to bound _PENDING_READ growth.
+    _PENDING_READ.pop(submission_id, None)
 
 
 # ---------------------------------------------------------------------------

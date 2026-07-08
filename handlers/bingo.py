@@ -444,10 +444,13 @@ async def on_bingo_text(update, context):
     if confirming:
         await bingo_queue.on_resend(context, uid, read)
         return
-    # fresh first submission
-    if storage.bingo_is_closed():
-        await update.effective_message.reply_text(
-            "All 10 prizes have been claimed — thanks for playing! 🎉")
+    # fresh first submission — re-apply the full submit gate (closed / already
+    # won / already being verified / no sheet), same as the photo path, because
+    # the awaiting flag may have been armed earlier when the user's state was
+    # different (e.g. they were 'confirming', then won).
+    gate = _bingo_gate_message(uid)
+    if gate:
+        await update.effective_message.reply_text(gate)
         return
     wait = _cooldown_remaining(uid)
     if wait:
