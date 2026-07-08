@@ -15,7 +15,7 @@ from telegram.ext import CommandHandler, MessageHandler, filters
 
 import storage
 from setup import manifest, sheets
-from utils.auth import facil_only
+from utils.auth import facil_only, is_admin
 
 log = logging.getLogger(__name__)
 
@@ -294,15 +294,121 @@ async def sync_year_ones(update, context):
         else:
             storage.add_waiting(uid, og)
             held += 1
-    await update.effective_message.reply_text(
+
+    # Check layer: surface handles the bot CAN'T match by @username — blank or
+    # malformed (can only get in via the email fallback), and ones we auto-cleaned
+    # (e.g. spaces removed) so a facil can confirm they're the person's real handle.
+    flagged = []
+    try:
+        for og, members in (await asyncio.to_thread(sheets.load_year1_members)).items():
+            for m in members:
+                name = m.get("name") or "?"
+                raw = (m.get("raw_handle") or "").strip()
+                clean = m.get("handle")
+                if clean is None:
+                    flagged.append((og, f"{name} — '{raw or '(blank)'}' can't be matched; "
+                                        "fix the handle or they join via email"))
+                elif re.search(r"\s", raw):
+                    flagged.append((og, f"{name} — '{raw}' → @{clean}; verify it's their real @username"))
+    except Exception as exc:
+        log.warning("couldn't audit Year 1 handles: %s", exc)
+
+    msg = (
         f"Synced from the sheet 🌟\nDM'd {sent} Year 1(s) their join link; "
         f"holding {held} until their facil opens the group. Anyone who hasn't "
         "messaged me yet gets theirs the moment they /start."
     )
+    if flagged:
+        flagged.sort()
+        shown = "\n".join(f"• {og}: {note}" for og, note in flagged[:25])
+        msg += f"\n\n⚠️ {len(flagged)} handle(s) need a look:\n{shown}"
+        if len(flagged) > 25:
+            msg += f"\n…and {len(flagged) - 25} more."
+    await update.effective_message.reply_text(msg)
+
+
+def _facil_ogs(update):
+    """OG(s) a (non-admin) facil may inspect — their own, from the facil roster."""
+    user = update.effective_user
+    og = _og_by_facil_handle(user.username) if user is not None else None
+    return {og} if og else set()
+
+
+@facil_only
+async def roster_status(update, context):
+    """DM-ONLY (student privacy): show, per Year 1 in an OG, whether they've reached
+    the bot and been placed. Usage: /roster_status PM1 (in a private chat with the
+    bot). Admins may check any OG; a facil may only check their own group."""
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        await update.effective_message.reply_text(
+            "For students' privacy I only share this in a private chat — DM me "
+            "/roster_status <OG> (e.g. /roster_status PM1) instead 🙏"
+        )
+        return
+
+    await ensure_rosters_loaded()  # off the loop; needed for the facil-OG check
+    og = sheets.og_code(context.args[0]) if context.args else None
+    if not og:
+        await update.effective_message.reply_text(
+            "Usage (DM me): /roster_status <OG> — e.g. /roster_status PM1"
+        )
+        return
+
+    # admins see any OG; facils are scoped to their own group
+    if not is_admin(update.effective_user):
+        allowed = _facil_ogs(update)
+        if og not in allowed:
+            own = ", ".join(sorted(allowed)) if allowed else "your own group"
+            await update.effective_message.reply_text(
+                f"You can only check {own}. Ask an admin for other OGs 🙏"
+            )
+            return
+
+    members = (await asyncio.to_thread(sheets.load_year1_members)).get(og, [])
+    if not members:
+        await update.effective_message.reply_text(f"No Year 1s are listed for {og} in the sheet.")
+        return
+
+    # started @usernames (normalized) -> user_id, so we can match a sheet handle
+    # to a real person who has messaged the bot
+    started = {}
+    for su in storage.get_started():
+        h = sheets.normalize_handle(su.get("username") or "")
+        if h:
+            started[h] = su["user_id"]
+
+    in_group = waiting = missing = bad = 0
+    rows = []
+    for m in members:
+        name = m.get("name") or "?"
+        handle = m.get("handle")
+        email = (m.get("email") or "?").lower()
+        if not handle:
+            bad += 1
+            rows.append(f"⚠️ {name} — unusable handle '{m.get('raw_handle') or '(blank)'}' — email: {email}")
+            continue
+        uid = started.get(handle)
+        if uid is None:
+            missing += 1
+            rows.append(f"❌ {name} (@{handle}) — hasn't /started, or their real @username "
+                        f"differs from the sheet — email: {email}")
+        elif storage.link_sent_to(uid):
+            in_group += 1
+            rows.append(f"✅ {name} (@{handle}) — in the group")
+        else:
+            waiting += 1
+            rows.append(f"⏳ {name} (@{handle}) — /started, waiting for the OG to open")
+
+    head = (f"{og} — {len(members)} in the sheet: {in_group} in group, "
+            f"{waiting} waiting, {missing} not reachable"
+            + (f", {bad} bad handle" if bad else ""))
+    await update.effective_message.reply_text(head + "\n\n" + "\n".join(rows))
 
 
 def register(app):
     app.add_handler(CommandHandler("add_year_ones", add_year_ones))
     app.add_handler(CommandHandler("sync_year_ones", sync_year_ones))
+    app.add_handler(CommandHandler("roster_status", roster_status))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))

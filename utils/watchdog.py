@@ -31,6 +31,7 @@ log = logging.getLogger("watchdog")
 
 _beat = time.monotonic()   # bumped ~every second by heartbeat() while the loop is alive
 _freeze_file = None        # persistent append-only log for stack dumps
+_BEAT_FILE = os.environ.get("HEARTBEAT_FILE", "heartbeat")  # touched each tick for the external supervisor
 
 
 def enable_faulthandler(logfile="freeze_dumps.log"):
@@ -81,13 +82,23 @@ def _hard_exit(reason):
     os._exit(1)
 
 
-async def heartbeat(interval=1.0):
-    """Bump the loop heartbeat on every tick. Schedule once on the event loop
-    (e.g. app.create_task(watchdog.heartbeat())). If the loop blocks, this stops
-    running and the watchdog notices."""
+async def heartbeat(interval=1.0, beat_file=None):
+    """Bump the in-memory heartbeat AND touch a heartbeat file every tick.
+
+    The in-memory beat feeds the in-process watchdog; the file lets an EXTERNAL
+    supervisor (supervise.sh) detect a freeze even when this process's GIL is held
+    by a C extension — which stops the in-process watchdog thread too. If the loop
+    blocks, both stop updating and the supervisor restarts us."""
     global _beat
+    path = beat_file if beat_file is not None else _BEAT_FILE
     while True:
         _beat = time.monotonic()
+        if path:
+            try:
+                with open(path, "w") as f:
+                    f.write(str(_beat))
+            except Exception:
+                pass  # never let the liveness write crash the loop
         await asyncio.sleep(interval)
 
 

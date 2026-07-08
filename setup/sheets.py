@@ -68,10 +68,13 @@ def og_code(text):
 
 def normalize_handle(raw):
     """Return a clean username (no @, lowercased) or None if it isn't a valid
-    Telegram handle (e.g. blank, or has a space like '@Duong Le')."""
+    Telegram handle. Strips a leading @ and ALL whitespace first, so a sloppy
+    sheet entry like '@Duong Le' or ' @ handle ' is salvaged to a matchable
+    handle rather than rejected outright (Telegram usernames contain no @ or
+    spaces, so removing them is always safe)."""
     if not raw:
         return None
-    h = raw.strip().lstrip("@").strip()
+    h = re.sub(r"\s+", "", raw).lstrip("@")
     return h.lower() if _USERNAME_RE.match(h) else None
 
 

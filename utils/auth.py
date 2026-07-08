@@ -119,6 +119,18 @@ async def is_facilitator(update, context):
     return False
 
 
+def is_admin(user):
+    """A top-level admin — someone in FACILITATOR_IDS or FACILITATOR_HANDLES (e.g.
+    @zzehao). Unlike a facil, they aren't tied to one OG, so they get unrestricted
+    access where facils are scoped to their own group. Sync + cheap (no network)."""
+    if user is None:
+        return False
+    if user.id in config.FACILITATORS:
+        return True
+    handle = (user.username or "").lstrip("@").lower()
+    return bool(handle and handle in config.FACILITATOR_HANDLES)
+
+
 def facil_only(handler):
     """Decorator: block the wrapped command unless the caller is a facil."""
 

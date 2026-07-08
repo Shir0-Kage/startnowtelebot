@@ -11,16 +11,18 @@ import time
 from utils import watchdog
 
 
-def test_heartbeat_bumps_the_beat():
+def test_heartbeat_bumps_beat_and_writes_file(tmp_path):
     watchdog._beat = 0.0
+    hb = tmp_path / "hb"
 
     async def run():
-        task = asyncio.create_task(watchdog.heartbeat(interval=0.01))
+        task = asyncio.create_task(watchdog.heartbeat(interval=0.01, beat_file=str(hb)))
         await asyncio.sleep(0.05)
         task.cancel()
 
     asyncio.run(run())
     assert watchdog._beat > 0.0
+    assert hb.exists()          # the external supervisor reads this file's mtime
 
 
 def test_watchdog_dumps_when_loop_blocks(tmp_path):
@@ -30,7 +32,7 @@ def test_watchdog_dumps_when_loop_blocks(tmp_path):
     try:
         async def run():
             watchdog._beat = time.monotonic()
-            beat = asyncio.create_task(watchdog.heartbeat(interval=0.1))
+            beat = asyncio.create_task(watchdog.heartbeat(interval=0.1, beat_file=""))
             await asyncio.sleep(0.2)          # let the heartbeat tick a few times
             time.sleep(2.5)                   # BLOCK the loop synchronously > threshold
             await asyncio.sleep(0.1)
@@ -54,7 +56,7 @@ def test_watchdog_forces_restart_on_persistent_stall(tmp_path, monkeypatch):
     try:
         async def run():
             watchdog._beat = time.monotonic()
-            beat = asyncio.create_task(watchdog.heartbeat(interval=0.1))
+            beat = asyncio.create_task(watchdog.heartbeat(interval=0.1, beat_file=""))
             await asyncio.sleep(0.2)
             time.sleep(3.0)                   # stall past the restart threshold
             await asyncio.sleep(0.1)
@@ -76,7 +78,7 @@ def test_watchdog_does_not_restart_when_disabled(tmp_path, monkeypatch):
     try:
         async def run():
             watchdog._beat = time.monotonic()
-            beat = asyncio.create_task(watchdog.heartbeat(interval=0.1))
+            beat = asyncio.create_task(watchdog.heartbeat(interval=0.1, beat_file=""))
             await asyncio.sleep(0.2)
             time.sleep(2.5)
             await asyncio.sleep(0.1)

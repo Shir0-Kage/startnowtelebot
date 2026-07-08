@@ -259,11 +259,11 @@ def test_on_bingo_image_shows_preview_and_waits_for_confirmation(bingo, store, m
     # allocate sheet 1 for the submitter (id 100)
     store.allocate_bingo_sheet(100, "alice")
 
-    def fake_read(sheet_no, image_bytes, index):
+    async def fake_ocr(sheet_no, image_bytes):
         return {"corner": sheet_no, "cells": [
             {"row": 0, "col": 0, "handle": "bob", "score": 95.0},
         ]}
-    monkeypatch.setattr(bingo.ocr, "read_submission", fake_read)
+    monkeypatch.setattr(bingo, "_run_ocr", fake_ocr)
 
     ctx = _context()
     ctx.user_data["awaiting_bingo"] = True
@@ -292,15 +292,15 @@ def test_ocr_confirm_yes_records_line_and_dms_subjects(bingo, store, monkeypatch
     for uid, h in [(1, "bob"), (2, "cara"), (3, "dan"), (4, "eve")]:
         store.mark_started(uid, h, h.title())
 
-    # OCR returns a full top-row line of 4 distinct, non-self, confident handles
-    def fake_read(sheet_no, image_bytes, index):
+    # OCR (isolated subprocess) returns a full top-row line of 4 confident handles
+    async def fake_ocr(sheet_no, image_bytes):
         return {"cells": [
             {"row": 0, "col": 0, "handle": "bob", "score": 95.0},
             {"row": 0, "col": 1, "handle": "cara", "score": 95.0},
             {"row": 0, "col": 3, "handle": "dan", "score": 95.0},
             {"row": 0, "col": 4, "handle": "eve", "score": 95.0},
         ]}
-    monkeypatch.setattr(bingo.ocr, "read_submission", fake_read)
+    monkeypatch.setattr(bingo, "_run_ocr", fake_ocr)
     monkeypatch.setattr(bingo.templates, "prompt_for", lambda s, r, c: f"prompt-{r}-{c}")
     # winning_lines: top row (row 0) complete (centre free auto-fills col 2)
     monkeypatch.setattr(bingo.lines, "winning_lines",
@@ -331,11 +331,11 @@ def test_ocr_confirm_yes_records_line_and_dms_subjects(bingo, store, monkeypatch
 def test_ocr_confirm_no_arms_text_mode_with_prefilled_list(bingo, store, monkeypatch):
     store.allocate_bingo_sheet(100, "alice")
 
-    def fake_read(sheet_no, image_bytes, index):
+    async def fake_ocr(sheet_no, image_bytes):
         return {"corner": sheet_no, "cells": [
             {"row": 0, "col": 0, "handle": "bob", "score": 95.0},
         ]}
-    monkeypatch.setattr(bingo.ocr, "read_submission", fake_read)
+    monkeypatch.setattr(bingo, "_run_ocr", fake_ocr)
 
     ctx = _context()
     ctx.user_data["awaiting_bingo"] = True
@@ -356,8 +356,10 @@ def test_ocr_confirm_no_arms_text_mode_with_prefilled_list(bingo, store, monkeyp
 
 def test_ocr_confirm_yes_no_line_reports_and_no_submission(bingo, store, monkeypatch):
     store.allocate_bingo_sheet(100, "alice")
-    monkeypatch.setattr(bingo.ocr, "read_submission",
-                        lambda s, b, i: {"cells": []})
+
+    async def _empty(sheet_no, image_bytes):
+        return {"cells": []}
+    monkeypatch.setattr(bingo, "_run_ocr", _empty)
     monkeypatch.setattr(bingo.lines, "winning_lines", lambda matched, sub: [])
     ctx = _context()
     ctx.user_data["awaiting_bingo"] = True
@@ -499,6 +501,26 @@ def test_bingo_text_handler_does_not_shadow_provisioning_on_text(store, monkeypa
 
     bingo_mock.assert_awaited()
     provisioning_mock.assert_awaited()
+
+
+def test_on_bingo_image_ocr_timeout_asks_retry_without_stranding(bingo, store, monkeypatch):
+    # the isolated OCR times out / fails -> _run_ocr returns None; the player is
+    # asked to retry and NO pending submission is left behind (which would lock
+    # them out), and the bot never blocked (the whole point of the subprocess).
+    store.allocate_bingo_sheet(100, "alice")
+
+    async def _fail(sheet_no, image_bytes):
+        return None
+    monkeypatch.setattr(bingo, "_run_ocr", _fail)
+    ctx = _context()
+    ctx.user_data["awaiting_bingo"] = True
+    tg_file = AsyncMock()
+    tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"img"))
+    ctx.bot.get_file = AsyncMock(return_value=tg_file)
+    upd = _photo_update(100, "alice")
+    asyncio.run(bingo.on_bingo_image(upd, ctx))
+    assert store.active_submission(100) is None
+    upd.effective_message.reply_text.assert_awaited()
 
 
 # --- confirm_button -> pass -> claim + announce + DM ------------------------
