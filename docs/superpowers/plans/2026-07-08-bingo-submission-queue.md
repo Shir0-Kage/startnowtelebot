@@ -771,6 +771,48 @@ def test_confirm_button_ignored_when_not_confirming(monkeypatch):
     upd = MagicMock(); upd.callback_query = q
     asyncio.run(bingo_queue.confirm_button(upd, _ctx()))
     assert bingo_queue._start_verification.await_count == 0
+
+
+def test_on_resend_routes_by_recognition(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    monkeypatch.setattr(fake, "user_id_for_handle", lambda h: 1, raising=False)
+    sid = fake.queue_submission(5, "submitter", 1)
+    fake.set_submission_status(sid, "confirming")
+    monkeypatch.setattr(bingo_queue, "_start_verification", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
+    # fully recognised resend -> hand off to verification
+    handled = asyncio.run(bingo_queue.on_resend(_ctx(), 5, {"cells": _cells(_TOP_ROW)}))
+    assert handled is True
+    assert bingo_queue._start_verification.await_count == 1
+    assert bingo_queue._send_confirmation.await_count == 0
+    # still-incomplete resend -> re-show the full confirmation
+    asyncio.run(bingo_queue.on_resend(_ctx(), 5, {"cells": _cells({})}))
+    assert bingo_queue._send_confirmation.await_count == 1
+    # a user with no confirming submission is not handled
+    assert asyncio.run(bingo_queue.on_resend(_ctx(), 999, {"cells": _cells(_TOP_ROW)})) is False
+    bingo_queue._PENDING_READ.pop(sid, None)
+
+
+def test_start_verification_hands_off_to_existing_pipeline(monkeypatch):
+    from handlers import bingo
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    monkeypatch.setattr(fake, "user_id_for_handle", lambda h: 1, raising=False)
+    fake.record_winning_members = MagicMock()
+    sid = fake.queue_submission(1, "submitter", 1)
+    fake.set_submission_status(sid, "confirming")
+    monkeypatch.setattr(bingo, "_cancel_job", MagicMock())
+    monkeypatch.setattr(bingo, "_dm_subjects", AsyncMock())
+    monkeypatch.setattr(bingo, "_finalize", AsyncMock())
+    line = [(0, 0, "alice"), (0, 1, "bob"), (0, 2, "carol"), (0, 3, "dan"), (0, 4, "eve")]
+    ctx = _ctx(); ctx.job_queue = None            # skip the tagged-people timeout arming
+    asyncio.run(bingo_queue._start_verification(ctx, sid, line, "submitter", 1))
+    assert fake.submission_status(sid) == "pending"      # handed to existing pipeline
+    fake.record_winning_members.assert_called_once()
+    bingo._cancel_job.assert_called_once()               # confirm-timeout cancelled
+    bingo._dm_subjects.assert_awaited_once()
+    bingo._finalize.assert_awaited_once()
 ```
 (The `_confirm_timeout_job` unit test lives in Task 5, where the function is defined.)
 
