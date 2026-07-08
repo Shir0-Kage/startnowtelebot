@@ -43,7 +43,7 @@
 
 **Files:**
 - Modify: `storage.py` (append near the other Human Bingo functions, after `pending_submissions`)
-- Test: `tests/test_bingo_queue_storage.py` (create)
+- Test: `tests/test_bingo_storage.py` (append — REUSE the existing `store` fixture defined at the top of that file; do NOT redefine it)
 
 **Interfaces:**
 - Consumes: existing `storage._conn`, `storage._lock`, `storage._now_iso`, `set_submission_status`.
@@ -57,20 +57,9 @@
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_bingo_queue_storage.py
-import importlib
-import pytest
-
-
-@pytest.fixture()
-def store(tmp_path, monkeypatch):
-    import config
-    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "q.db"))
-    import storage
-    importlib.reload(storage)          # rebind module globals to the temp DB path
-    storage.init_db()
-    return storage
-
+# tests/test_bingo_storage.py — append. Reuses the existing `store` fixture
+# (fresh storage module bound to an isolated temp DB) already defined at the top
+# of this file. Do NOT redefine the fixture or re-import pytest.
 
 def test_queue_dedupes_queued_and_confirming_for_one_user(store):
     a = store.queue_submission(1, "alice", 3)
@@ -107,8 +96,8 @@ def test_active_slot_count_counts_confirming_pending_verified(store):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_bingo_queue_storage.py -q`
-Expected: FAIL — `AttributeError: module 'storage' has no attribute 'queue_submission'`.
+Run: `.venv/Scripts/python.exe -m pytest tests/test_bingo_storage.py -q`
+Expected: the 4 new tests FAIL — `AttributeError: module 'storage' has no attribute 'queue_submission'` (existing tests still pass).
 
 - [ ] **Step 3: Implement the helpers**
 
@@ -176,13 +165,13 @@ def submission_status(submission_id):
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_bingo_queue_storage.py -q`
-Expected: PASS (4 tests).
+Run: `.venv/Scripts/python.exe -m pytest tests/test_bingo_storage.py -q`
+Expected: PASS (existing tests + 4 new).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add storage.py tests/test_bingo_queue_storage.py
+git add storage.py tests/test_bingo_storage.py
 git commit -m "Add bingo submission-queue state helpers to storage"
 ```
 
@@ -192,7 +181,7 @@ git commit -m "Add bingo submission-queue state helpers to storage"
 
 **Files:**
 - Modify: `bingo_text.py`
-- Test: `tests/test_bingo_text.py` (append; create the file if it does not exist)
+- Test: `tests/test_bingo_text.py` (append — file EXISTS; `import bingo_text` is already at the top, don't duplicate it. The existing `test_build_template_text_has_24_lines...` still passes against the cached string.)
 
 **Interfaces:**
 - Consumes: `data.bingo_templates` (`GRID`, `is_free`, `prompt_for`, `SHEETS`).
@@ -204,9 +193,7 @@ git commit -m "Add bingo submission-queue state helpers to storage"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_bingo_text.py — append (create the file if it does not exist)
-import bingo_text
-
+# tests/test_bingo_text.py — append (bingo_text is already imported at the top)
 
 def test_blank_templates_are_pregenerated_and_cached():
     a = bingo_text.build_template_text(3)
