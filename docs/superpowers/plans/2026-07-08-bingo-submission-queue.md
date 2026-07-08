@@ -921,13 +921,13 @@ git commit -m "Add submitter confirm/resend, verification hand-off, confirm time
 ### Task 7: Rolling replacement when a slot frees at verification
 
 **Files:**
-- Modify: `handlers/bingo.py` (`_finalize`, `_award`)
+- Modify: `handlers/bingo.py` (`_finalize` only)
 - Test: `tests/test_bingo_handlers.py`
 
 **Interfaces:**
-- Produces: after the existing tagged-people pipeline reaches a terminal outcome, it pulls the next queued submission into confirming. Concretely: at the end of `_finalize`'s fail branch (`status='failed'`) and at every terminal path in `_award`, call `await bingo_queue.maybe_kickoff(context)` (import `from handlers import bingo_queue` lazily inside the function to avoid a cycle).
+- Produces: when the existing tagged-people pipeline FAILS a submission, it pulls the next queued submission into confirming. Concretely: in `_finalize`'s fail branch (the `verdict != "pass"` path that sets `status='failed'`), after `await _notify_submitter_failed(...)`, call `await bingo_queue.maybe_kickoff(context)` (import `from handlers import bingo_queue` lazily inside the function to avoid a cycle).
 
-> Rationale (approved spec decision): a tagged-people rejection or 12h verify-timeout frees the slot, so the next queued player is promoted. A win occupies its slot permanently (`verified` counts toward `active_slot_count`), so `maybe_kickoff` after `_award` is a safe no-op while 10 are in flight and correctly does nothing once the game closes.
+> Rationale (approved spec decision): a tagged-people rejection or the 12h verify-timeout — both land in `_finalize`'s fail branch — frees the slot, so the next queued player is promoted. A WIN does NOT free a slot: `_award` marks the submission `verified`, which still counts toward `active_slot_count`, and the game closes at the 10th prize — so `_award` needs NO hook. The confirming-phase timeout (`_confirm_timeout_job`, Task 5) already promotes on its own failure. Hooking only the single `_finalize` fail branch avoids editing `_award`'s multiple return paths.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -962,24 +962,16 @@ def test_failed_verification_promotes_next_queued(bingo, store, monkeypatch):
 Run: `.venv/Scripts/python.exe -m pytest tests/test_bingo_handlers.py::test_failed_verification_promotes_next_queued -q`
 Expected: FAIL — `b` stays `queued` (no kickoff hook yet).
 
-- [ ] **Step 3: Add the hook**
+- [ ] **Step 3: Add the hook (only in `_finalize`'s fail branch)**
 
-In `handlers/bingo.py`, `_finalize`, in the `verdict != "pass"` branch, after `await _notify_submitter_failed(context, submission_id)` and before its `return`:
-
-```python
-        from handlers import bingo_queue
-        await bingo_queue.maybe_kickoff(context)
-        return
-```
-
-In `handlers/bingo.py`, `_award`: ensure every terminal path ends by promoting the next queued. The cleanest way is to add, as the final statement of the function (reached on the normal win path), and immediately before each early `return` (the already-won branch and the `claim_no is None` branch):
+In `handlers/bingo.py`, `_finalize`, in the `verdict != "pass"` branch, after the existing `await _notify_submitter_failed(context, submission_id)` and before that branch's `return`, add:
 
 ```python
         from handlers import bingo_queue
         await bingo_queue.maybe_kickoff(context)
 ```
 
-Keep it minimal and correct — every `return` in `_award` must be preceded by this call (or refactored to fall through to a single trailing call).
+Do NOT modify `_award` (a win holds its slot — see the rationale above). This is the ONLY change to `handlers/bingo.py` in this task.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
