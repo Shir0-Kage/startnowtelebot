@@ -932,26 +932,28 @@ git commit -m "Add submitter confirm/resend, verification hand-off, confirm time
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_bingo_handlers.py — append. Uses the file's existing temp-DB storage
-# fixture; follow its established fixture name/style (shown here as `bingo_store`).
+# tests/test_bingo_handlers.py — append. Uses the file's REAL `bingo` + `store`
+# fixtures (temp DB + reloaded modules — the `bingo` fixture also reloads
+# bingo_queue) and its existing `_context()` helper + top-level AsyncMock/MagicMock.
 
-def test_failed_verification_promotes_next_queued(monkeypatch, bingo_store):
-    import asyncio
-    from unittest.mock import AsyncMock, MagicMock
-    import storage
-    from handlers import bingo, bingo_queue
-    a = storage.queue_submission(1, "a", 1)
-    storage.set_submission_status(a, "pending")            # in tagged-people verify
-    storage.record_winning_members(a, [
-        {"row": 0, "col": 0, "handle": "x", "prompt": "p", "target_user_id": None}])
-    b = storage.queue_submission(2, "b", 1)                # queued behind
+def test_failed_verification_promotes_next_queued(bingo, store, monkeypatch):
+    from handlers import bingo_queue
+    # `a` is in tagged-people verification ('pending') with a 5-cell line whose
+    # subjects are ALL unreachable (target None) -> it FAILS evaluation (needs
+    # len-1 = 4 yeses, has 0). A 1-cell line would spuriously PASS (required_yes 0).
+    a = store.queue_submission(1, "a", 1)
+    store.set_submission_status(a, "pending")
+    store.record_winning_members(a, [
+        {"row": 0, "col": c, "handle": h, "prompt": "p", "target_user_id": None}
+        for c, h in enumerate(["v", "w", "x", "y", "z"])])
+    b = store.queue_submission(2, "b", 1)                   # queued behind
     bingo_queue._PENDING_READ[b] = {"read": {"cells": []}, "handle": "b", "sheet_no": 1}
     monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
     monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
-    ctx = MagicMock(); ctx.bot = AsyncMock(); ctx.job_queue = None
-    asyncio.run(bingo._finalize(ctx, a, final=True))       # no answers -> fail
-    assert storage.submission_status(a) == "failed"
-    assert storage.submission_status(b) == "confirming"    # promoted
+    ctx = _context()
+    asyncio.run(bingo._finalize(ctx, a, final=True))        # no yeses -> fail
+    assert store.submission_status(a) == "failed"
+    assert store.submission_status(b) == "confirming"       # next promoted
     bingo_queue._PENDING_READ.pop(b, None)
 ```
 
