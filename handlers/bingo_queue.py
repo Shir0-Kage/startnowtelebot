@@ -137,3 +137,82 @@ async def _confirm_timeout_job(context):
         except Exception:
             pass
     await maybe_kickoff(context)
+
+
+async def confirm_button(update, context):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, _, sid_s = query.data.split(":")
+        sid = int(sid_s)
+    except (ValueError, AttributeError):
+        return
+    if storage.submission_status(sid) != "confirming":
+        return                                    # stale / already resolved
+    pending = _PENDING_READ.get(sid)
+    if pending is None:
+        return
+    res = evaluate(pending["read"], pending["handle"], pending["sheet_no"])
+    if not res["fully_recognised"]:
+        return                                    # full-template path governs
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _start_verification(
+        context, sid, res["line"], pending["handle"], pending["sheet_no"])
+
+
+async def on_resend(context, uid, read):
+    """Handle a typed resend from a submitter in the 'confirming' phase.
+    Returns True if the user was confirming (message consumed), else False."""
+    mine = [s for s in storage.confirming_submissions()
+            if s["submitter_user_id"] == uid]
+    if not mine:
+        return False
+    sub = mine[0]
+    handle = sub.get("submitter_handle") or ""
+    _PENDING_READ[sub["id"]] = {
+        "read": read, "handle": handle, "sheet_no": sub["sheet_no"]}
+    res = evaluate(read, handle, sub["sheet_no"])
+    if res["fully_recognised"]:
+        await _start_verification(
+            context, sub["id"], res["line"], handle, sub["sheet_no"])
+    else:
+        await _send_confirmation(context, sub)    # re-show full + flags
+    return True
+
+
+async def _start_verification(context, submission_id, line, handle, sheet_no):
+    """Submitter confirmed a fully-recognised line: hand off to the existing
+    tagged-people pipeline (flip to 'pending', DM subjects, arm the 12h timeout,
+    evaluate once)."""
+    from handlers import bingo                     # lazy: avoid import cycle
+    from data import bingo_templates as templates
+    bingo._cancel_job(context, f"bingo:confirmwait:{submission_id}")
+    members = [{
+        "row": r, "col": c, "handle": h,
+        "prompt": templates.prompt_for(sheet_no, r, c),
+        "target_user_id": storage.user_id_for_handle(h),
+    } for (r, c, h) in line]
+    storage.record_winning_members(submission_id, members)
+    storage.set_submission_status(submission_id, "pending")
+    sub = storage.submission_by_id(submission_id)
+    if sub is not None:
+        try:
+            await context.bot.send_message(
+                chat_id=sub["submitter_user_id"],
+                text="Nice line! 🎯 I'm checking with the people you tagged — I'll "
+                     "message you the moment it's verified (they have 12 hours).",
+            )
+        except Exception:
+            pass
+    if getattr(context, "job_queue", None) is not None:
+        context.job_queue.run_once(
+            bingo._confirmation_timeout,
+            when=config.BINGO_CONFIRM_TIMEOUT,
+            data={"submission_id": submission_id},
+            name=f"bingo:timeout:{submission_id}",
+        )
+    await bingo._dm_subjects(context, submission_id, members)
+    await bingo._finalize(context, submission_id)
