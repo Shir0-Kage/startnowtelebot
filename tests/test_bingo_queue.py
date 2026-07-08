@@ -79,3 +79,78 @@ def test_confirmation_full_flags_unreachable(monkeypatch):
     assert "@dan" in text and "/start" in text
     assert ctx.bot.send_message.await_args.kwargs.get("reply_markup") is None
     bingo_queue._PENDING_READ.pop(sid, None)
+
+
+class FakeStore:
+    """In-memory stand-in for the queue subset of storage."""
+    def __init__(self):
+        self.rows = {}
+        self._id = 0
+    def queue_submission(self, uid, handle, sheet_no):
+        self.rows = {i: r for i, r in self.rows.items()
+                     if not (r["submitter_user_id"] == uid
+                             and r["status"] in ("queued", "confirming"))}
+        self._id += 1
+        self.rows[self._id] = {"id": self._id, "submitter_user_id": uid,
+                               "submitter_handle": handle, "sheet_no": sheet_no,
+                               "status": "queued", "submitted_at": f"{self._id:05d}"}
+        return self._id
+    def queued_in_order(self):
+        return sorted((dict(r) for r in self.rows.values()
+                       if r["status"] == "queued"),
+                      key=lambda r: (r["submitted_at"], r["id"]))
+    def confirming_submissions(self):
+        return sorted((dict(r) for r in self.rows.values()
+                       if r["status"] == "confirming"),
+                      key=lambda r: (r["submitted_at"], r["id"]))
+    def active_slot_count(self):
+        return sum(1 for r in self.rows.values()
+                   if r["status"] in ("confirming", "pending", "verified"))
+    def set_submission_status(self, sid, status):
+        self.rows[sid]["status"] = status
+    def submission_status(self, sid):
+        return self.rows[sid]["status"] if sid in self.rows else None
+    def submission_by_id(self, sid):
+        return dict(self.rows[sid]) if sid in self.rows else None
+
+
+def test_kickoff_promotes_only_ten_earliest(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
+    for uid in range(1, 13):
+        fake.queue_submission(uid, f"u{uid}", 1)
+    asyncio.run(bingo_queue.maybe_kickoff(_ctx()))
+    assert bingo_queue._send_confirmation.await_count == 10
+    assert fake.active_slot_count() == 10
+    assert len(fake.queued_in_order()) == 2
+
+
+def test_enqueue_replies_in_queue_then_kicks_off(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
+    ctx = _ctx()
+    asyncio.run(bingo_queue.enqueue(ctx, 1, "alice", 1, {"cells": _cells({})}))
+    text = ctx.bot.send_message.await_args_list[0].kwargs["text"]
+    assert "queue" in text.lower()
+    assert bingo_queue._send_confirmation.await_count == 1   # 1 queued, slot free
+    bingo_queue._PENDING_READ.pop(1, None)
+
+
+def test_confirm_timeout_fails_and_promotes(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    a = fake.queue_submission(1, "a", 1); fake.set_submission_status(a, "confirming")
+    b = fake.queue_submission(2, "b", 1)                 # queued behind
+    bingo_queue._PENDING_READ[b] = {"read": {"cells": _cells({})},
+                                    "handle": "b", "sheet_no": 1}
+    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
+    ctx = _ctx(); ctx.job = MagicMock(); ctx.job.data = {"submission_id": a}
+    asyncio.run(bingo_queue._confirm_timeout_job(ctx))
+    assert fake.submission_status(a) == "failed"
+    assert fake.submission_status(b) == "confirming"     # next promoted
+    bingo_queue._PENDING_READ.pop(b, None)

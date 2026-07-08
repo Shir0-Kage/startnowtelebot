@@ -43,6 +43,9 @@ import config
 import storage
 from data import bingo_templates as templates
 from setup import sheets
+# Module-level import is safe: bingo_queue imports handlers.bingo only lazily
+# (inside its functions), so there's no top-level circular import.
+from handlers import bingo_queue
 
 log = logging.getLogger(__name__)
 
@@ -451,55 +454,7 @@ async def on_bingo_text(update, context):
     read = bingo_text.parse_submission(
         sheet_no, update.effective_message.text or "", _roster_index()
     )
-    await _process_read(update, context, uid, handle, sheet_no, read)
-
-
-async def _process_read(update, context, uid, handle, sheet_no, read):
-    """Shared tail for both submission modes: takes read_submission()'s (or
-    bingo_text.parse_submission()'s) {"cells"} shape and does line detection,
-    recording, and subject DMs. (The printed sheet number is an OCR-unreadable
-    pixel font, so there's no corner-based wrong-sheet check -- verification
-    leans entirely on per-person confirmation.)"""
-    matched, prompts = _matched_and_prompts(read.get("cells", []), handle, sheet_no)
-
-    candidate_lines = lines.winning_lines(matched, handle)
-    if not candidate_lines:
-        await update.effective_message.reply_text(
-            "No bingo yet — I couldn't find 5 in a row of confirmed Year 1s. "
-            "Double-check the handles and try again in a minute! 🔁"
-        )
-        return
-
-    line = lines.pick_best_line(candidate_lines)
-    submission_id = storage.start_bingo_submission(uid, handle, sheet_no)
-
-    members = []
-    for (r, c, h) in line:
-        members.append({
-            "row": r, "col": c, "handle": h,
-            "prompt": prompts.get((r, c)) or templates.prompt_for(sheet_no, r, c),
-            "target_user_id": storage.user_id_for_handle(h),
-        })
-    storage.record_winning_members(submission_id, members)
-
-    await update.effective_message.reply_text(
-        "Nice line! 🎯 I'm checking with the people you tagged — I'll message you "
-        "the moment it's verified (they have 12 hours to respond)."
-    )
-
-    await _dm_subjects(context, submission_id, members)
-
-    # arm the 12h finaliser
-    if context.job_queue is not None:
-        context.job_queue.run_once(
-            _confirmation_timeout,
-            when=config.BINGO_CONFIRM_TIMEOUT,
-            data={"submission_id": submission_id},
-            name=f"bingo:timeout:{submission_id}",
-        )
-
-    # re-evaluate immediately in case cached answers already clinch it
-    await _finalize(context, submission_id)
+    await bingo_queue.enqueue(context, uid, handle, sheet_no, read)
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +465,7 @@ async def bingo_ocr_confirm_button(update, context):
     """Yes/No on the OCR preview shown after on_bingo_image.
 
     Yes proceeds with the original OCR read exactly as scanned (via
-    _process_read, same as the text path). No discards it and re-arms
+    bingo_queue.enqueue, same as the text path). No discards it and re-arms
     awaiting_bingo_text with that same read pre-filled as text (see
     bingo_text.build_prefilled_text), so the player corrects only the wrong
     or missing squares instead of re-photographing the whole card.
@@ -553,9 +508,8 @@ async def bingo_ocr_confirm_button(update, context):
         )
         return
 
-    await _process_read(
-        update, context, uid, pending["handle"], pending["sheet_no"], pending["read"],
-    )
+    await bingo_queue.enqueue(
+        context, uid, pending["handle"], pending["sheet_no"], pending["read"])
 
 
 def _confirm_keyboard(submission_id, row, col):

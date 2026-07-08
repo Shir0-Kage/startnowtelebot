@@ -32,6 +32,14 @@ def store(tmp_path, monkeypatch):
 @pytest.fixture()
 def bingo(store, monkeypatch):
     """handlers.bingo with a fixed 2-OG roster and no network."""
+    # bingo_queue is imported at collection time (by test_bingo_queue.py) and
+    # caches a module-level `storage` reference. The `store` fixture pops+reloads
+    # `storage` into a fresh, initialised module, so reload bingo_queue too to
+    # re-bind its `storage` to that same module -- otherwise the submit path
+    # (on_bingo_text / OCR-confirm -> bingo_queue.enqueue) would write to a stale,
+    # unconnected storage instead of the test DB handlers.bingo uses.
+    import handlers.bingo_queue as bingo_queue
+    importlib.reload(bingo_queue)
     import handlers.bingo as bingo
     importlib.reload(bingo)
 
@@ -287,7 +295,12 @@ def test_on_bingo_image_shows_preview_and_waits_for_confirmation(bingo, store, m
         == {"bingoocr:yes", "bingoocr:no"}
 
 
-def test_ocr_confirm_yes_records_line_and_dms_subjects(bingo, store, monkeypatch):
+def test_ocr_confirm_yes_queues_and_sends_short_confirmation(bingo, store, monkeypatch):
+    # New queue flow: a confirmed OCR read is enqueued, not verified straight
+    # away. With an empty queue and free slots it's immediately promoted to
+    # 'confirming', and because the line is fully recognised (all subjects have
+    # /started) the submitter gets the SHORT confirmation with a Confirm button.
+    # Subjects are NOT DM'd yet -- that happens only after the submitter confirms.
     store.allocate_bingo_sheet(100, "alice")
     for uid, h in [(1, "bob"), (2, "cara"), (3, "dan"), (4, "eve")]:
         store.mark_started(uid, h, h.title())
@@ -317,14 +330,20 @@ def test_ocr_confirm_yes_records_line_and_dms_subjects(bingo, store, monkeypatch
 
     _tap_ocr_confirm(bingo, ctx, 100, "yes")
 
-    sub = store.active_submission(100)
-    assert sub is not None and sub["status"] == "pending"
-    members = store.winning_members(sub["id"])
-    assert {m["handle"] for m in members} == {"bob", "cara", "dan", "eve"}
-    # each reachable subject was DM'd a Yes/No keyboard
-    assert ctx.bot.send_message.await_count == 4
-    # a 12h timeout job was armed
-    ctx.job_queue.run_once.assert_called_once()
+    # the submission is now 'confirming' (queued -> promoted), not 'pending', so
+    # active_submission (pending-only) sees nothing; find it via confirming.
+    confirming = store.confirming_submissions()
+    assert len(confirming) == 1 and confirming[0]["submitter_user_id"] == 100
+    assert store.active_submission(100) is None
+    # the LAST DM to the submitter is the short confirmation with a Confirm button
+    last = ctx.bot.send_message.await_args
+    assert last.kwargs["chat_id"] == 100
+    buttons = [b for row in last.kwargs["reply_markup"].inline_keyboard for b in row]
+    assert any(b.callback_data.startswith("bingoq:confirm:") for b in buttons)
+    # subjects (chat_ids 1-4) are NOT messaged at submit time
+    sent_chat_ids = {c.kwargs.get("chat_id") for c in ctx.bot.send_message.await_args_list}
+    assert not (sent_chat_ids & {1, 2, 3, 4})
+    ctx.job_queue.run_once.assert_called_once()  # confirm-timeout armed
     assert ctx.user_data.get("bingo_ocr_pending") is None
 
 
@@ -354,7 +373,11 @@ def test_ocr_confirm_no_arms_text_mode_with_prefilled_list(bingo, store, monkeyp
     assert "@bob" in sent_text and "R1C1" in sent_text
 
 
-def test_ocr_confirm_yes_no_line_reports_and_no_submission(bingo, store, monkeypatch):
+def test_ocr_confirm_yes_no_line_still_queues_full_template(bingo, store, monkeypatch):
+    # New behavior: EVERY confirmed submission is queued -- even one with no
+    # recognised line. Once promoted to 'confirming', a not-fully-recognised read
+    # gets the FULL fill-in template (no Confirm button) so the submitter can fix
+    # blanks and resend. (The old "no bingo / no submission" path is gone.)
     store.allocate_bingo_sheet(100, "alice")
 
     async def _empty(sheet_no, image_bytes):
@@ -369,10 +392,17 @@ def test_ocr_confirm_yes_no_line_reports_and_no_submission(bingo, store, monkeyp
     upd = _photo_update(100, "alice")
     asyncio.run(bingo.on_bingo_image(upd, ctx))
 
-    q = _tap_ocr_confirm(bingo, ctx, 100, "yes")
+    _tap_ocr_confirm(bingo, ctx, 100, "yes")
 
-    assert store.active_submission(100) is None  # nothing pending
-    q.message.reply_text.assert_awaited()  # "no bingo yet" message
+    # the submission is queued and promoted to 'confirming', not 'pending'
+    confirming = store.confirming_submissions()
+    assert len(confirming) == 1 and confirming[0]["submitter_user_id"] == 100
+    assert store.active_submission(100) is None
+    # the confirmation DM is the full fill-in template with NO Confirm button
+    last = ctx.bot.send_message.await_args
+    assert last.kwargs["chat_id"] == 100
+    assert "R1C1" in last.kwargs["text"]
+    assert last.kwargs.get("reply_markup") is None
 
 
 def test_ocr_confirm_stale_button_is_a_no_op(bingo, store):
@@ -387,7 +417,12 @@ def test_ocr_confirm_stale_button_is_a_no_op(bingo, store):
 
 # --- on_bingo_text full pipeline -> pending + DMs subjects ------------------
 
-def test_on_bingo_text_full_pipeline_success(bingo, store, monkeypatch):
+def test_on_bingo_text_queues_and_sends_short_confirmation(bingo, store, monkeypatch):
+    # New queue flow for the text path: a typed submission is enqueued and, with
+    # a free slot, promoted to 'confirming'. All four tagged subjects have
+    # /started so the line is fully recognised -> the submitter gets the SHORT
+    # confirmation carrying the line and a Confirm button; subjects are not DM'd.
+    #
     # real Telegram usernames are 5-32 chars; use a roster with realistic
     # handles so normalize_handle doesn't reject a typed handle for being
     # too short (unlike the default short-handle roster used elsewhere,
@@ -425,26 +460,38 @@ def test_on_bingo_text_full_pipeline_success(bingo, store, monkeypatch):
     upd = _text_update(100, "alice", body)
     asyncio.run(bingo.on_bingo_text(upd, ctx))
 
-    sub = store.active_submission(100)
-    assert sub is not None and sub["status"] == "pending"
-    members = store.winning_members(sub["id"])
-    assert {m["handle"] for m in members} == {"bobby", "carol", "daniel", "evelyn"}
-    assert ctx.bot.send_message.await_count == 4
-    ctx.job_queue.run_once.assert_called_once()
+    # the submission is 'confirming' (queued -> promoted), not 'pending'
+    confirming = store.confirming_submissions()
+    assert len(confirming) == 1 and confirming[0]["submitter_user_id"] == 100
+    assert store.active_submission(100) is None
+    # the LAST DM to the submitter carries the line and a Confirm button
+    last = ctx.bot.send_message.await_args
+    assert last.kwargs["chat_id"] == 100
+    assert "@bobby" in last.kwargs["text"]
+    buttons = [b for row in last.kwargs["reply_markup"].inline_keyboard for b in row]
+    assert any(b.callback_data.startswith("bingoq:confirm:") for b in buttons)
+    # subjects (chat_ids 1-4) are NOT messaged at submit time
+    sent_chat_ids = {c.kwargs.get("chat_id") for c in ctx.bot.send_message.await_args_list}
+    assert not (sent_chat_ids & {1, 2, 3, 4})
+    ctx.job_queue.run_once.assert_called_once()  # confirm-timeout armed
     assert ctx.user_data.get("awaiting_bingo_text") is not True
 
 
 def test_on_bingo_text_exact_match_miss_degrades_gracefully(bingo, store, monkeypatch):
     # a typed handle that isn't on the roster is not fuzzy-rescued -- the
-    # cell just stays unmatched, same as a low-confidence OCR read.
+    # cell just stays unmatched, same as a low-confidence OCR read. There's no
+    # recognised line, but the submission is still queued and the submitter gets
+    # the full fill-in template (via bot.send_message) to correct and resend.
     store.allocate_bingo_sheet(100, "alice")
     monkeypatch.setattr(bingo.lines, "winning_lines", lambda matched, sub: [])
     ctx = _context()
     ctx.user_data["awaiting_bingo_text"] = True
     upd = _text_update(100, "alice", "R1C1: p - @ghostwriter")
     asyncio.run(bingo.on_bingo_text(upd, ctx))
+    confirming = store.confirming_submissions()
+    assert len(confirming) == 1 and confirming[0]["submitter_user_id"] == 100
     assert store.active_submission(100) is None
-    upd.effective_message.reply_text.assert_awaited()
+    ctx.bot.send_message.assert_awaited()  # the full fill-in template
 
 
 def test_on_bingo_text_ignores_when_flag_not_set(bingo, store):

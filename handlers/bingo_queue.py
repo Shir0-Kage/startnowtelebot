@@ -78,3 +78,62 @@ async def _send_confirmation(context, sub):
         text="You're up! Fill in the @handles below (fix any blanks) and send the "
              "whole list back to me:\n\n" + preview + flag,
     )
+
+
+async def enqueue(context, uid, handle, sheet_no, read):
+    """Record a submission into the queue and tell the user their position, then
+    fire kickoff if a slot is free (auto-batches once 10 are queued)."""
+    sid = storage.queue_submission(uid, handle, sheet_no)
+    _PENDING_READ[sid] = {"read": read, "handle": handle, "sheet_no": sheet_no}
+    position = len(storage.queued_in_order())
+    await context.bot.send_message(
+        chat_id=uid,
+        text=f"You're in the queue (#{position})! 📥 I'll message you if I need "
+             "you to confirm your squares — hang tight. 🙂",
+    )
+    await maybe_kickoff(context)
+
+
+async def maybe_kickoff(context):
+    """Promote queued submissions into 'confirming' until the 10 in-flight slots
+    are full, sending each its confirmation message."""
+    while storage.active_slot_count() < config.BINGO_PRIZE_LIMIT:
+        queued = storage.queued_in_order()
+        if not queued:
+            return
+        sub = queued[0]
+        storage.set_submission_status(sub["id"], "confirming")
+        _arm_confirm_timeout(context, sub["id"])
+        await _send_confirmation(context, sub)
+
+
+def _arm_confirm_timeout(context, submission_id):
+    """Arm the submitter-confirm 12h timeout for a 'confirming' submission."""
+    jq = getattr(context, "job_queue", None)
+    if jq is None:
+        return
+    jq.run_once(
+        _confirm_timeout_job,
+        when=config.BINGO_CONFIRM_TIMEOUT,
+        data={"submission_id": submission_id},
+        name=f"bingo:confirmwait:{submission_id}",
+    )
+
+
+async def _confirm_timeout_job(context):
+    """12h submitter-confirm deadline: if still unconfirmed, fail and roll on."""
+    sid = context.job.data["submission_id"]
+    if storage.submission_status(sid) != "confirming":
+        return
+    storage.set_submission_status(sid, "failed")
+    sub = storage.submission_by_id(sid)
+    if sub is not None:
+        try:
+            await context.bot.send_message(
+                chat_id=sub["submitter_user_id"],
+                text="Your bingo confirmation timed out, so your slot passed to the "
+                     "next player. Submit again anytime to re-join the queue! 🔁",
+            )
+        except Exception:
+            pass
+    await maybe_kickoff(context)
