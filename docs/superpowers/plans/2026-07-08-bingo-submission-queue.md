@@ -645,12 +645,27 @@ In `handlers/bingo.py`:
             context, uid, pending["handle"], pending["sheet_no"], pending["read"])
 ```
 
-- [ ] **Step 4: Update existing handler tests + run**
+- [ ] **Step 4: Update the four existing handler tests that assert the OLD immediate-processing behavior**
 
-In `tests/test_bingo_handlers.py`, any test that submitted a winning card and asserted immediate `_dm_subjects`/`start_bingo_submission`/"Nice line!" now asserts queue behavior instead: after submit, the submission is `queued` (or `confirming` if a slot was free) and the reply mentions the queue; tagged-people DMs happen only after confirmation (covered in Task 6/7 tests). Update those assertions; do not delete coverage.
+Exactly FOUR tests in `tests/test_bingo_handlers.py` break and must be REWRITTEN to assert the new queue behavior (do NOT delete coverage, do NOT weaken to trivial asserts). All four have an empty queue and no active slots, so `submit → enqueue → queued → maybe_kickoff → confirming → _send_confirmation`.
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_bingo_queue.py tests/test_bingo_handlers.py -q`
-Expected: PASS.
+New-flow facts (true for all four):
+- The submission is now status `confirming`, NOT `pending`. `store.active_submission(100)` returns `None` (it only matches `pending`). Find the submission via `store.confirming_submissions()` → one row with `submitter_user_id == 100`.
+- All player-facing messages now go through `ctx.bot.send_message` (enqueue sends "You're in the queue (#1)…", then `_send_confirmation` sends the confirmation). The success path does NOT call `update.effective_message.reply_text`.
+- Subjects (chat_ids 1-4) are NOT DM'd at submit time — that happens only after the submitter confirms (Task 6). Assert no `send_message` went to chat_ids 1-4.
+- `ctx.job_queue.run_once` is called once (arming the confirm-timeout `bingo:confirmwait:<id>`).
+- `winning_members` is NOT recorded yet at submit (recorded later in `_start_verification`, Task 6) — do not assert on it here.
+
+Per-test rewrite (rename each to fit the new behavior):
+1. `test_ocr_confirm_yes_records_line_and_dms_subjects` → e.g. `test_ocr_confirm_yes_queues_and_sends_short_confirmation`: subjects are `mark_started` (reachable) and `winning_lines` is monkeypatched to a complete line ⇒ fully recognised. After `_tap_ocr_confirm(...,"yes")`: assert exactly one `confirming` submission for user 100; `active_submission(100) is None`; the LAST `ctx.bot.send_message` went to `chat_id=100` and its `reply_markup` contains a button whose `callback_data` starts with `bingoq:confirm:`; assert no `send_message` call used `chat_id` in {1,2,3,4}.
+2. `test_ocr_confirm_yes_no_line_reports_and_no_submission` → e.g. `test_ocr_confirm_yes_no_line_still_queues_full_template`: `winning_lines=[]` ⇒ not recognised. After yes: assert one `confirming` submission for user 100; the confirmation `ctx.bot.send_message` to `chat_id=100` is the FULL template (text contains `"R1C1"`) and has NO `reply_markup` (no confirm button). (The old "no bingo / no submission" expectation is intentionally removed — queuing every submission is the new behavior.)
+3. `test_on_bingo_text_full_pipeline_success` → e.g. `test_on_bingo_text_queues_and_sends_short_confirmation`: 4 subjects `mark_started`; `winning_lines` monkeypatched to a complete line ⇒ fully recognised. After `on_bingo_text`: one `confirming` submission for user 100; the LAST `ctx.bot.send_message` to `chat_id=100` carries the line and a `bingoq:confirm:` button; no DMs to 1-4; `run_once` called once.
+4. `test_on_bingo_text_exact_match_miss_degrades_gracefully`: `winning_lines=[]` ⇒ not recognised. After `on_bingo_text`: one `confirming` submission for user 100; replace the old `upd.effective_message.reply_text.assert_awaited()` with `ctx.bot.send_message.assert_awaited()` (the full template).
+
+Leave `test_on_bingo_text_ignores_when_flag_not_set` unchanged — Task 5 does not touch `on_bingo_text`'s awaiting-flag guard (Task 8 does), and that user has no confirming submission, so it still no-ops.
+
+Run: `.venv/Scripts/python.exe -m pytest tests/test_bingo_queue.py tests/test_bingo_handlers.py -q` then the FULL suite `.venv/Scripts/python.exe -m pytest -q`.
+Expected: PASS (the four rewritten tests + everything else). If any OTHER existing test breaks, investigate — only these four should need changes.
 
 - [ ] **Step 5: Commit**
 
