@@ -300,7 +300,9 @@ def _cells(matched):
     return cells
 
 
-_TOP_ROW = {(0, 0): "alice", (0, 1): "bob", (0, 3): "dan", (0, 4): "eve"}
+_TOP_ROW = {(0, 0): "alice", (0, 1): "bob", (0, 2): "carol", (0, 3): "dan", (0, 4): "eve"}
+# Row 0 does NOT cross the FREE centre (2,2), so a COMPLETE row-0 line needs all
+# 5 cells matched. (Only row 2, col 2, and the two diagonals lose the centre.)
 
 
 def test_evaluate_fully_recognised_when_line_all_reachable(monkeypatch):
