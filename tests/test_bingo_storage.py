@@ -239,3 +239,38 @@ def test_claim_is_race_safe_under_threads(store):
     granted = sorted(s for s in results if s is not None)
     assert granted == list(range(1, 11))  # exactly 10, no dup slot numbers
     assert store.bingo_prizes_claimed() == 10
+
+
+# --- submission queue ------------------------------------------------------
+
+def test_queue_dedupes_queued_and_confirming_for_one_user(store):
+    a = store.queue_submission(1, "alice", 3)
+    store.set_submission_status(a, "confirming")
+    a2 = store.queue_submission(1, "alice", 3)          # replaces the confirming row
+    ids = [r["id"] for r in store.queued_in_order()]
+    assert a2 in ids and a not in ids
+    assert store.submission_status(a) is None           # old row gone
+
+
+def test_queue_does_not_touch_pending_or_verified(store):
+    p = store.queue_submission(1, "alice", 3)
+    store.set_submission_status(p, "pending")           # in tagged-people verify
+    q = store.queue_submission(1, "alice", 3)           # must NOT delete the pending row
+    assert store.submission_status(p) == "pending"
+    assert store.submission_status(q) == "queued"
+
+
+def test_ordering_is_by_time_then_id(store):
+    a = store.queue_submission(1, "a", 1)
+    b = store.queue_submission(2, "b", 1)
+    ids = [r["id"] for r in store.queued_in_order()]
+    assert ids == sorted(ids)                            # same-second inserts fall back to id
+
+
+def test_active_slot_count_counts_confirming_pending_verified(store):
+    s = store.queue_submission(1, "alice", 3)
+    assert store.active_slot_count() == 0               # queued is not a slot
+    for status, expected in [("confirming", 1), ("pending", 1), ("verified", 1),
+                             ("failed", 0)]:
+        store.set_submission_status(s, status)
+        assert store.active_slot_count() == expected

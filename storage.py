@@ -735,3 +735,62 @@ def pending_submissions():
             "ORDER BY id"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def queue_submission(user_id, handle, sheet_no):
+    """Enqueue a fresh submission, replacing this user's existing queued/confirming
+    one (never a row already in tagged-people verification). Returns its id."""
+    with _lock:
+        _conn.execute(
+            "DELETE FROM bingo_submissions "
+            "WHERE submitter_user_id = ? AND status IN ('queued','confirming')",
+            (user_id,),
+        )
+        cur = _conn.execute(
+            "INSERT INTO bingo_submissions "
+            "(submitter_user_id, submitter_handle, sheet_no, corner_read, "
+            " status, submitted_at, verified_at) "
+            "VALUES (?, ?, ?, NULL, 'queued', ?, NULL)",
+            (user_id, (handle or "").lower(), sheet_no, _now_iso()),
+        )
+        _conn.commit()
+        return cur.lastrowid
+
+
+def queued_in_order():
+    """All 'queued' submissions, earliest first."""
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM bingo_submissions WHERE status = 'queued' "
+            "ORDER BY submitted_at, id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def confirming_submissions():
+    """All 'confirming' submissions, earliest first."""
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM bingo_submissions WHERE status = 'confirming' "
+            "ORDER BY submitted_at, id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def active_slot_count():
+    """In-flight prize slots: confirming + verifying(pending) + won(verified)."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT COUNT(*) AS c FROM bingo_submissions "
+            "WHERE status IN ('confirming','pending','verified')"
+        ).fetchone()
+    return row["c"]
+
+
+def submission_status(submission_id):
+    """A submission's current status string, or None if it doesn't exist."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT status FROM bingo_submissions WHERE id = ?", (submission_id,)
+        ).fetchone()
+    return row["status"] if row else None
