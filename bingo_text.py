@@ -22,9 +22,7 @@ from setup import sheets
 _LINE_RE = re.compile(r"^\s*R(\d+)\s*C(\d+)\s*:\s*(.*)$", re.IGNORECASE)
 
 
-def build_template_text(sheet_no):
-    """The fill-in-the-blank list a player replies to, one line per non-FREE
-    cell, 1-indexed (R1C1..R5C5, FREE centre R3C3 omitted)."""
+def _build_template_text(sheet_no):
     lines = []
     for row in range(templates.GRID):
         for col in range(templates.GRID):
@@ -33,6 +31,26 @@ def build_template_text(sheet_no):
             prompt = templates.prompt_for(sheet_no, row, col)
             lines.append(f"R{row + 1}C{col + 1}: {prompt} - ")
     return "\n".join(lines)
+
+
+# Pre-build the 15 blank fill-in templates once at import (they never change).
+_TEMPLATE_CACHE = {n: _build_template_text(n) for n in templates.SHEETS}
+
+
+def build_template_text(sheet_no):
+    """The cached fill-in-the-blank list a player replies to, one line per
+    non-FREE cell (R1C1..R5C5, FREE centre omitted). Pre-generated at import."""
+    return _TEMPLATE_CACHE[sheet_no]
+
+
+def build_line_confirm_text(sheet_no, line):
+    """Render just the winning line's cells for the short confirm message.
+    `line`: list of (row, col, handle) 0-indexed, as bingo_lines returns."""
+    out = []
+    for row, col, handle in line:
+        prompt = templates.prompt_for(sheet_no, row, col)
+        out.append(f"R{row + 1}C{col + 1}: {prompt} - @{handle}")
+    return "\n".join(out)
 
 
 def build_prefilled_text(sheet_no, cells):

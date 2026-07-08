@@ -117,3 +117,19 @@ def test_parse_submission_shape_invariant():
     seen = {(c["row"], c["col"]) for c in read["cells"]}
     assert (2, 2) not in seen  # FREE cell never emitted
     assert len(seen) == 24
+
+
+def test_blank_templates_are_pregenerated_and_cached():
+    a = bingo_text.build_template_text(3)
+    b = bingo_text.build_template_text(3)
+    assert a is b                                  # cached object, not rebuilt
+    assert set(bingo_text._TEMPLATE_CACHE) == set(range(1, 16))
+
+
+def test_build_line_confirm_text_lists_only_the_line():
+    line = [(0, 0, "alice"), (0, 1, "bob"), (0, 3, "dan"), (0, 4, "eve")]
+    out = bingo_text.build_line_confirm_text(1, line)
+    assert out.count("\n") == 3                    # 4 cells -> 4 lines
+    assert out.startswith("R1C1:")
+    assert "@alice" in out and "@eve" in out
+    assert "@bob" in out and "@dan" in out
