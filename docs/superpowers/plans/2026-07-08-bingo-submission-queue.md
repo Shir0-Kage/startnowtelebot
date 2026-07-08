@@ -990,7 +990,8 @@ git commit -m "Roll the queue forward when a verification slot frees"
 ### Task 8: Register handlers, route resends, facil close, re-arm on startup
 
 **Files:**
-- Modify: `handlers/bingo.py` (`on_bingo_text` routing, `register`, and the startup re-arm); `handlers/bingo_queue.py` (`register`, `close_round`, `rearm_confirm_timeouts`); `main.py` if it registers modules there.
+- Modify: `handlers/bingo_queue.py` (add `register`, `close_round`, `rearm_confirm_timeouts`); `handlers/bingo.py` (rewrite `on_bingo_text` guard/routing; add `close_bingo_round` facil command; call `bingo_queue.register(app)` inside `register`; call `bingo_queue.rearm_confirm_timeouts(app)` at the end of `rearm_bingo_timeouts`).
+- **`main.py` is NOT modified** — it already calls `bingo.register(app)` (line 123) and `bingo.rearm_bingo_timeouts(app)` (line 77), so the queue's registration and re-arm run through those existing hooks.
 - Test: `tests/test_bingo_queue.py`; `tests/test_bingo_handlers.py`
 
 **Interfaces:**
@@ -999,8 +1000,8 @@ git commit -m "Roll the queue forward when a verification slot frees"
   - `bingo_queue.close_round(context)` — `await maybe_kickoff(context)` (facil fallback: fire whoever's queued even if fewer than 10).
   - `bingo_queue.rearm_confirm_timeouts(app)` — for each `storage.confirming_submissions()`, re-arm `_confirm_timeout_job` using `submitted_at + BINGO_CONFIRM_TIMEOUT` (mirror `bingo.rearm_bingo_timeouts` clock math; floor delay at 5s).
   - `on_bingo_text` change: proceed when EITHER `awaiting_bingo_text` is set OR the user has a confirming submission; for a confirming user, parse and delegate to `bingo_queue.on_resend` and return; otherwise the fresh-submission path enqueues.
-  - `bingo.close_bingo_round` — a thin `@facil_only` command calling `bingo_queue.close_round(context)` then replying "Kicked off the bingo queue. 🚀". Register `CommandHandler("close_bingo_round", close_bingo_round)`.
-  - `bingo.register` also calls `bingo_queue.register(app)`; the startup path that calls `rearm_bingo_timeouts(app)` also calls `bingo_queue.rearm_confirm_timeouts(app)`.
+  - `bingo.close_bingo_round` — a thin `@facil_only` command calling `bingo_queue.close_round(context)` then replying "Kicked off the bingo queue. 🚀". Register `CommandHandler("close_bingo_round", close_bingo_round)` in `bingo.register`.
+  - `bingo.register(app)` also calls `bingo_queue.register(app)`; `bingo.rearm_bingo_timeouts(app)` calls `bingo_queue.rearm_confirm_timeouts(app)` at its end. (`main.py` already invokes both `bingo` hooks — no `main.py` change.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1018,7 +1019,34 @@ def test_close_round_fires_with_fewer_than_ten(monkeypatch):
     assert fake.active_slot_count() == 3
 ```
 
-Also add a routing test in `tests/test_bingo_handlers.py`: a private text message from a user with a `confirming` submission (and `awaiting_bingo_text` unset) is delegated to `bingo_queue.on_resend` (monkeypatch `bingo_queue.on_resend` to an AsyncMock, assert awaited); a user with neither the flag nor a confirming submission is ignored (no reply, `on_resend` not awaited).
+Also append two routing tests to `tests/test_bingo_handlers.py` (real `bingo`+`store` fixtures, `_text_update`/`_context()` helpers):
+
+```python
+def test_on_bingo_text_confirming_user_routes_to_resend(bingo, store, monkeypatch):
+    from handlers import bingo_queue
+    store.allocate_bingo_sheet(100, "alice")
+    sid = store.queue_submission(100, "alice", store.get_bingo_sheet(100))
+    store.set_submission_status(sid, "confirming")
+    monkeypatch.setattr(bingo_queue, "on_resend", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "enqueue", AsyncMock())
+    ctx = _context()                              # awaiting_bingo_text NOT set
+    upd = _text_update(100, "alice", "R1C1: p - @bob")
+    asyncio.run(bingo.on_bingo_text(upd, ctx))
+    bingo_queue.on_resend.assert_awaited_once()   # confirming -> resend path
+    bingo_queue.enqueue.assert_not_awaited()      # not a fresh submission
+
+
+def test_on_bingo_text_non_confirming_non_awaiting_is_ignored(bingo, store, monkeypatch):
+    from handlers import bingo_queue
+    monkeypatch.setattr(bingo_queue, "on_resend", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "enqueue", AsyncMock())
+    ctx = _context()                              # awaiting flag unset, no confirming sub
+    upd = _text_update(200, "nobody", "R1C1: p - @bob")
+    asyncio.run(bingo.on_bingo_text(upd, ctx))
+    upd.effective_message.reply_text.assert_not_awaited()
+    bingo_queue.on_resend.assert_not_awaited()
+    bingo_queue.enqueue.assert_not_awaited()
+```
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -1111,18 +1139,20 @@ async def close_bingo_round(update, context):
     await update.effective_message.reply_text("Kicked off the bingo queue. 🚀")
 ```
 
-In `bingo.register(app)`, add:
+In `bingo.register(app)`, add (near the other `app.add_handler` calls — `CommandHandler` is already imported in `bingo.py`):
 
 ```python
     app.add_handler(CommandHandler("close_bingo_round", close_bingo_round))
     bingo_queue.register(app)
 ```
 
-Find the startup call to `rearm_bingo_timeouts(app)` (in `main.py`'s post-init) and add alongside it:
+At the END of `bingo.rearm_bingo_timeouts(app)` (in `handlers/bingo.py`), add — `bingo_queue` is already imported at the module top:
 
 ```python
     bingo_queue.rearm_confirm_timeouts(app)
 ```
+
+`main.py` needs NO change: it already calls `bingo.register(app)` (line 123) and `bingo.rearm_bingo_timeouts(app)` (line 77).
 
 - [ ] **Step 4: Run the full suite**
 
