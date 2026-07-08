@@ -628,6 +628,8 @@ async def _finalize(context, submission_id, final=False):
         # timeout or two misses -> failed, retry allowed after cooldown
         storage.set_submission_status(submission_id, "failed")
         await _notify_submitter_failed(context, submission_id)
+        from handlers import bingo_queue
+        await bingo_queue.maybe_kickoff(context)
         return
 
     await _award(context, submission_id)
