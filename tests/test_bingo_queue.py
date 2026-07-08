@@ -1,3 +1,6 @@
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
 import bingo_lines
 from handlers import bingo_queue
 
@@ -40,3 +43,39 @@ def test_evaluate_no_line(monkeypatch):
     res = bingo_queue.evaluate({"cells": _cells({(0, 0): "alice"})}, "submitter", 1)
     assert res["line"] is None
     assert res["fully_recognised"] is False and res["unreachable"] == []
+
+
+def _ctx():
+    ctx = MagicMock()
+    ctx.bot = AsyncMock()
+    return ctx
+
+
+def test_confirmation_short_when_fully_recognised(monkeypatch):
+    monkeypatch.setattr(bingo_queue.storage, "user_id_for_handle", lambda h: 1)
+    sid = 7
+    bingo_queue._PENDING_READ[sid] = {
+        "read": {"cells": _cells(_TOP_ROW)}, "handle": "submitter", "sheet_no": 1}
+    ctx = _ctx()
+    asyncio.run(bingo_queue._send_confirmation(
+        ctx, {"id": sid, "submitter_user_id": 99}))
+    kwargs = ctx.bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == 99
+    assert "@alice" in kwargs["text"]
+    assert kwargs.get("reply_markup") is not None            # confirm button
+    bingo_queue._PENDING_READ.pop(sid, None)
+
+
+def test_confirmation_full_flags_unreachable(monkeypatch):
+    monkeypatch.setattr(bingo_queue.storage, "user_id_for_handle",
+                        lambda h: None if h == "dan" else 1)
+    sid = 8
+    bingo_queue._PENDING_READ[sid] = {
+        "read": {"cells": _cells(_TOP_ROW)}, "handle": "submitter", "sheet_no": 1}
+    ctx = _ctx()
+    asyncio.run(bingo_queue._send_confirmation(
+        ctx, {"id": sid, "submitter_user_id": 99}))
+    text = ctx.bot.send_message.await_args.kwargs["text"]
+    assert "@dan" in text and "/start" in text
+    assert ctx.bot.send_message.await_args.kwargs.get("reply_markup") is None
+    bingo_queue._PENDING_READ.pop(sid, None)

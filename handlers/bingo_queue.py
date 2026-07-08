@@ -9,6 +9,8 @@ submitter confirms a fully-recognised line, _start_verification flips the row to
 
 import logging
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
 import bingo_lines as lines
 import bingo_text
 import config
@@ -37,3 +39,42 @@ def evaluate(read, submitter_handle, sheet_no):
                    if storage.user_id_for_handle(h) is None]
     return {"line": line, "fully_recognised": not unreachable,
             "unreachable": unreachable}
+
+
+def _confirm_keyboard(submission_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Confirm",
+                             callback_data=f"bingoq:confirm:{submission_id}")
+    ]])
+
+
+async def _send_confirmation(context, sub):
+    """DM the submitter their confirmation message: short (winning line + a
+    Confirm button) when fully recognised, else the full fill-in template with a
+    /start flag for any matched-but-unreachable handle."""
+    sid = sub["id"]
+    uid = sub["submitter_user_id"]
+    pending = _PENDING_READ.get(sid)
+    if pending is None:
+        log.warning("no pending read for submission %s; can't send confirmation", sid)
+        return
+    res = evaluate(pending["read"], pending["handle"], pending["sheet_no"])
+    if res["fully_recognised"]:
+        text = ("You're up! 🎉 Here's your winning line — tap Confirm if it's "
+                "right:\n\n"
+                + bingo_text.build_line_confirm_text(pending["sheet_no"], res["line"]))
+        await context.bot.send_message(
+            chat_id=uid, text=text, reply_markup=_confirm_keyboard(sid))
+        return
+    preview = bingo_text.build_prefilled_text(
+        pending["sheet_no"], pending["read"].get("cells", []))
+    flag = ""
+    if res["unreachable"]:
+        who = ", ".join(f"@{h}" for h in res["unreachable"])
+        flag = (f"\n\n⚠️ {who} hasn't started the bot yet — ask them to send it "
+                "/start so I can verify them, then resend your list.")
+    await context.bot.send_message(
+        chat_id=uid,
+        text="You're up! Fill in the @handles below (fix any blanks) and send the "
+             "whole list back to me:\n\n" + preview + flag,
+    )
