@@ -225,3 +225,15 @@ def test_start_verification_hands_off_to_existing_pipeline(monkeypatch):
     bingo._cancel_job.assert_called_once()               # confirm-timeout cancelled
     bingo._dm_subjects.assert_awaited_once()
     bingo._finalize.assert_awaited_once()
+
+
+def test_close_round_fires_with_fewer_than_ten(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
+    for uid in (1, 2, 3):
+        fake.queue_submission(uid, f"u{uid}", 1)
+    asyncio.run(bingo_queue.close_round(_ctx()))
+    assert bingo_queue._send_confirmation.await_count == 3
+    assert fake.active_slot_count() == 3

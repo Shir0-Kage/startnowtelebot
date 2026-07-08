@@ -43,6 +43,7 @@ import config
 import storage
 from data import bingo_templates as templates
 from setup import sheets
+from utils.auth import facil_only
 # Module-level import is safe: bingo_queue imports handlers.bingo only lazily
 # (inside its functions), so there's no top-level circular import.
 from handlers import bingo_queue
@@ -421,39 +422,38 @@ async def on_bingo_image(update, context):
 
 
 async def on_bingo_text(update, context):
-    if not context.user_data.get("awaiting_bingo_text"):
-        return  # not expecting typed handles from this user; ignore
-    context.user_data["awaiting_bingo_text"] = False
-
     chat = update.effective_chat
     if chat is None or chat.type != "private":
         return
-
     uid = update.effective_user.id
-    handle = sheets.normalize_handle(update.effective_user.username) or ""
+    awaiting = context.user_data.get("awaiting_bingo_text")
+    confirming = any(s["submitter_user_id"] == uid
+                     for s in storage.confirming_submissions())
+    if not awaiting and not confirming:
+        return                                     # not for us
+    context.user_data["awaiting_bingo_text"] = False
 
+    handle = sheets.normalize_handle(update.effective_user.username) or ""
+    sheet_no = storage.get_bingo_sheet(uid)
+    if sheet_no is None:
+        await update.effective_message.reply_text(
+            "Grab your card first with /get_bingo 🙂")
+        return
+    read = bingo_text.parse_submission(
+        sheet_no, update.effective_message.text or "", _roster_index())
+    if confirming:
+        await bingo_queue.on_resend(context, uid, read)
+        return
+    # fresh first submission
     if storage.bingo_is_closed():
         await update.effective_message.reply_text(
-            "All 10 prizes have been claimed — thanks for playing! 🎉"
-        )
+            "All 10 prizes have been claimed — thanks for playing! 🎉")
         return
     wait = _cooldown_remaining(uid)
     if wait:
         await update.effective_message.reply_text(
-            f"Hold on {wait}s before trying again 🙂"
-        )
+            f"Hold on {wait}s before trying again 🙂")
         return
-
-    sheet_no = storage.get_bingo_sheet(uid)
-    if sheet_no is None:
-        await update.effective_message.reply_text(
-            "Grab your card first with /get_bingo 🙂"
-        )
-        return
-
-    read = bingo_text.parse_submission(
-        sheet_no, update.effective_message.text or "", _roster_index()
-    )
     await bingo_queue.enqueue(context, uid, handle, sheet_no, read)
 
 
@@ -790,11 +790,19 @@ def rearm_bingo_timeouts(app):
         )
         rearmed += 1
     log.info("re-armed %d bingo confirmation timeout(s)", rearmed)
+    bingo_queue.rearm_confirm_timeouts(app)
+
+
+@facil_only
+async def close_bingo_round(update, context):
+    await bingo_queue.close_round(context)
+    await update.effective_message.reply_text("Kicked off the bingo queue. 🚀")
 
 
 def register(app):
     app.add_handler(CommandHandler("get_bingo", get_bingo))
     app.add_handler(CommandHandler("submit_bingo", submit_bingo))
+    app.add_handler(CommandHandler("close_bingo_round", close_bingo_round))
     app.add_handler(CallbackQueryHandler(confirm_button, pattern=r"^bingoconf:"))
     app.add_handler(CallbackQueryHandler(bingo_mode_button, pattern=r"^bingomode:"))
     app.add_handler(CallbackQueryHandler(bingo_ocr_confirm_button, pattern=r"^bingoocr:"))
@@ -816,3 +824,4 @@ def register(app):
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
         on_bingo_text,
     ), group=1)
+    bingo_queue.register(app)

@@ -8,8 +8,10 @@ submitter confirms a fully-recognised line, _start_verification flips the row to
 """
 
 import logging
+from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CallbackQueryHandler
 
 import bingo_lines as lines
 import bingo_text
@@ -216,3 +218,37 @@ async def _start_verification(context, submission_id, line, handle, sheet_no):
         )
     await bingo._dm_subjects(context, submission_id, members)
     await bingo._finalize(context, submission_id)
+
+
+# ---------------------------------------------------------------------------
+# Startup + registration
+# ---------------------------------------------------------------------------
+
+async def close_round(context):
+    """Facil fallback: process whoever is queued even if fewer than 10."""
+    await maybe_kickoff(context)
+
+
+def register(app):
+    app.add_handler(CallbackQueryHandler(confirm_button, pattern=r"^bingoq:confirm:"))
+
+
+def rearm_confirm_timeouts(app):
+    """Re-arm the submitter-confirm 12h timeout for every 'confirming' submission
+    after a restart (mirror bingo.rearm_bingo_timeouts' clock math)."""
+    jq = app.job_queue
+    if jq is None:
+        return
+    now = datetime.now(config.TIMEZONE)
+    for sub in storage.confirming_submissions():
+        try:
+            submitted = datetime.fromisoformat(sub["submitted_at"])
+        except (ValueError, KeyError, TypeError):
+            submitted = now
+        if submitted.tzinfo is None:
+            from zoneinfo import ZoneInfo
+            submitted = submitted.replace(tzinfo=ZoneInfo("Asia/Singapore"))
+        delay = (submitted + config.BINGO_CONFIRM_TIMEOUT - now).total_seconds()
+        jq.run_once(_confirm_timeout_job, when=max(delay, 5),
+                    data={"submission_id": sub["id"]},
+                    name=f"bingo:confirmwait:{sub['id']}")

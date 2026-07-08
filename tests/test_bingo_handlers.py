@@ -502,6 +502,32 @@ def test_on_bingo_text_ignores_when_flag_not_set(bingo, store):
     assert store.active_submission(100) is None
 
 
+def test_on_bingo_text_confirming_user_routes_to_resend(bingo, store, monkeypatch):
+    from handlers import bingo_queue
+    store.allocate_bingo_sheet(100, "alice")
+    sid = store.queue_submission(100, "alice", store.get_bingo_sheet(100))
+    store.set_submission_status(sid, "confirming")
+    monkeypatch.setattr(bingo_queue, "on_resend", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "enqueue", AsyncMock())
+    ctx = _context()                              # awaiting_bingo_text NOT set
+    upd = _text_update(100, "alice", "R1C1: p - @bob")
+    asyncio.run(bingo.on_bingo_text(upd, ctx))
+    bingo_queue.on_resend.assert_awaited_once()   # confirming -> resend path
+    bingo_queue.enqueue.assert_not_awaited()      # not a fresh submission
+
+
+def test_on_bingo_text_non_confirming_non_awaiting_is_ignored(bingo, store, monkeypatch):
+    from handlers import bingo_queue
+    monkeypatch.setattr(bingo_queue, "on_resend", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "enqueue", AsyncMock())
+    ctx = _context()                              # awaiting flag unset, no confirming sub
+    upd = _text_update(200, "nobody", "R1C1: p - @bob")
+    asyncio.run(bingo.on_bingo_text(upd, ctx))
+    upd.effective_message.reply_text.assert_not_awaited()
+    bingo_queue.on_resend.assert_not_awaited()
+    bingo_queue.enqueue.assert_not_awaited()
+
+
 # --- group-collision regression: text handler must not shadow provisioning --
 
 def test_bingo_text_handler_does_not_shadow_provisioning_on_text(store, monkeypatch):
