@@ -520,14 +520,16 @@ git commit -m "Build short/full bingo confirmation messages with unreachable fla
 - Test: `tests/test_bingo_queue.py`; `tests/test_bingo_handlers.py` (update immediate-processing tests)
 
 **Interfaces:**
-- Consumes: `storage.queue_submission`, `storage.queued_in_order`, `storage.active_slot_count`, `storage.set_submission_status`, `_send_confirmation`, `_arm_confirm_timeout`.
+- Consumes: `storage.queue_submission`, `storage.queued_in_order`, `storage.active_slot_count`, `storage.set_submission_status`, `storage.submission_status`, `storage.submission_by_id`, `_send_confirmation`, `config.BINGO_CONFIRM_TIMEOUT`.
 - Produces:
   - `async enqueue(context, uid, handle, sheet_no, read) -> None` — `queue_submission`, stash `_PENDING_READ[sid]`, DM "You're in the queue (#N)…", then `await maybe_kickoff(context)`.
   - `async maybe_kickoff(context) -> None` — while `active_slot_count() < config.BINGO_PRIZE_LIMIT` and a queued submission exists: take the earliest, `set_submission_status(id, 'confirming')`, `_arm_confirm_timeout(context, id)`, `await _send_confirmation(...)`.
+  - `def _arm_confirm_timeout(context, submission_id)` — `context.job_queue.run_once(_confirm_timeout_job, when=config.BINGO_CONFIRM_TIMEOUT, data={"submission_id": id}, name=f"bingo:confirmwait:{id}")` (guard `job_queue is not None`).
+  - `async _confirm_timeout_job(context)` — if `submission_status(id) == 'confirming'`: `set_submission_status(id, 'failed')`, DM the submitter their slot passed on, `await maybe_kickoff(context)`. (This is the submitter-confirm 12h deadline; the confirm/resend RESPONSE handlers live in Task 6.)
 
 > Ordering: `maybe_kickoff` is a loop guarded by `active_slot_count()`, so when the 10th submission enqueues it fires confirmations for the earliest 10 in one pass; the 11th enqueue finds the count already at 10 and does nothing. When a slot later frees (Task 6/7), calling `maybe_kickoff` again promotes the next queued.
 
-> Task 5/6 split: `maybe_kickoff` calls `_arm_confirm_timeout(context, id)`. Define the real one now (its body is trivial and it's also given in Task 6); if you truly must defer, add `def _arm_confirm_timeout(context, sid): pass` as a temporary stub so Task 5 tests pass, and Task 6 replaces it.
+> Why the timeout machinery is here (not Task 6): `maybe_kickoff` must arm a REAL confirm-timeout (the rewritten handler tests assert `run_once` fires), and `_arm_confirm_timeout` references `_confirm_timeout_job`, so both must be defined in this task. Task 6 adds only the submitter's confirm/resend RESPONSE handlers and reuses these.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -591,6 +593,22 @@ def test_enqueue_replies_in_queue_then_kicks_off(monkeypatch):
     assert "queue" in text.lower()
     assert bingo_queue._send_confirmation.await_count == 1   # 1 queued, slot free
     bingo_queue._PENDING_READ.pop(1, None)
+
+
+def test_confirm_timeout_fails_and_promotes(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    a = fake.queue_submission(1, "a", 1); fake.set_submission_status(a, "confirming")
+    b = fake.queue_submission(2, "b", 1)                 # queued behind
+    bingo_queue._PENDING_READ[b] = {"read": {"cells": _cells({})},
+                                    "handle": "b", "sheet_no": 1}
+    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
+    ctx = _ctx(); ctx.job = MagicMock(); ctx.job.data = {"submission_id": a}
+    asyncio.run(bingo_queue._confirm_timeout_job(ctx))
+    assert fake.submission_status(a) == "failed"
+    assert fake.submission_status(b) == "confirming"     # next promoted
+    bingo_queue._PENDING_READ.pop(b, None)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -627,6 +645,38 @@ async def maybe_kickoff(context):
         storage.set_submission_status(sub["id"], "confirming")
         _arm_confirm_timeout(context, sub["id"])
         await _send_confirmation(context, sub)
+
+
+def _arm_confirm_timeout(context, submission_id):
+    """Arm the submitter-confirm 12h timeout for a 'confirming' submission."""
+    jq = getattr(context, "job_queue", None)
+    if jq is None:
+        return
+    jq.run_once(
+        _confirm_timeout_job,
+        when=config.BINGO_CONFIRM_TIMEOUT,
+        data={"submission_id": submission_id},
+        name=f"bingo:confirmwait:{submission_id}",
+    )
+
+
+async def _confirm_timeout_job(context):
+    """12h submitter-confirm deadline: if still unconfirmed, fail and roll on."""
+    sid = context.job.data["submission_id"]
+    if storage.submission_status(sid) != "confirming":
+        return
+    storage.set_submission_status(sid, "failed")
+    sub = storage.submission_by_id(sid)
+    if sub is not None:
+        try:
+            await context.bot.send_message(
+                chat_id=sub["submitter_user_id"],
+                text="Your bingo confirmation timed out, so your slot passed to the "
+                     "next player. Submit again anytime to re-join the queue! 🔁",
+            )
+        except Exception:
+            pass
+    await maybe_kickoff(context)
 ```
 
 In `handlers/bingo.py`:
@@ -683,13 +733,11 @@ git commit -m "Queue bingo submissions on submit and kick off the earliest 10"
 - Test: `tests/test_bingo_queue.py`
 
 **Interfaces:**
-- Consumes: `_PENDING_READ`, `evaluate`, `_send_confirmation`, `maybe_kickoff`, `storage.confirming_submissions`, `storage.submission_status`, `storage.set_submission_status`, `storage.record_winning_members`, `storage.submission_by_id`, `storage.user_id_for_handle`, `data.bingo_templates.prompt_for`, and (lazily, to avoid cycle) `handlers.bingo._dm_subjects`, `handlers.bingo._finalize`, `handlers.bingo._confirmation_timeout`, `handlers.bingo._cancel_job`, `config.BINGO_CONFIRM_TIMEOUT`.
+- Consumes: `_PENDING_READ`, `evaluate`, `_send_confirmation`, `storage.confirming_submissions`, `storage.submission_status`, `storage.set_submission_status`, `storage.record_winning_members`, `storage.submission_by_id`, `storage.user_id_for_handle`, `data.bingo_templates.prompt_for`, and (lazily, to avoid cycle) `handlers.bingo._dm_subjects`, `handlers.bingo._finalize`, `handlers.bingo._confirmation_timeout`, `handlers.bingo._cancel_job`, `config.BINGO_CONFIRM_TIMEOUT`. (`_arm_confirm_timeout` and `_confirm_timeout_job` were already defined in Task 5 — do NOT redefine them.)
 - Produces:
-  - `def _arm_confirm_timeout(context, submission_id)` — `context.job_queue.run_once(_confirm_timeout_job, when=config.BINGO_CONFIRM_TIMEOUT, data={"submission_id": id}, name=f"bingo:confirmwait:{id}")` (guard `context.job_queue is not None`).
   - `async confirm_button(update, context)` — handles `bingoq:confirm:<id>`; only acts if `submission_status(id) == 'confirming'`; re-`evaluate`s the pending read; if fully recognised → `_start_verification`; else silently ignore (the full-template path governs).
   - `async on_resend(context, uid, read) -> bool` — if the user has a `confirming` submission: update its `_PENDING_READ`, re-`evaluate`; fully recognised → `_start_verification`; else → `_send_confirmation` again. Returns True if it handled a confirming user, else False.
   - `async _start_verification(context, submission_id, line, handle, sheet_no)` — cancel `bingo:confirmwait:<id>`; build `members` (row,col,handle,prompt,target_user_id); `record_winning_members`; `set_submission_status(id, 'pending')`; DM the submitter "Nice line!…"; arm existing `bingo._confirmation_timeout` (name `bingo:timeout:<id>`); `await bingo._dm_subjects`; `await bingo._finalize`.
-  - `async _confirm_timeout_job(context)` — if `submission_status(id) == 'confirming'`: `set_submission_status(id, 'failed')`, DM the submitter their slot passed on, `await maybe_kickoff(context)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -723,46 +771,18 @@ def test_confirm_button_ignored_when_not_confirming(monkeypatch):
     upd = MagicMock(); upd.callback_query = q
     asyncio.run(bingo_queue.confirm_button(upd, _ctx()))
     assert bingo_queue._start_verification.await_count == 0
-
-
-def test_confirm_timeout_fails_and_promotes(monkeypatch):
-    fake = FakeStore()
-    monkeypatch.setattr(bingo_queue, "storage", fake)
-    a = fake.queue_submission(1, "a", 1); fake.set_submission_status(a, "confirming")
-    b = fake.queue_submission(2, "b", 1)                 # queued behind
-    bingo_queue._PENDING_READ[b] = {"read": {"cells": _cells({})},
-                                    "handle": "b", "sheet_no": 1}
-    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
-    monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
-    ctx = _ctx(); ctx.job = MagicMock(); ctx.job.data = {"submission_id": a}
-    asyncio.run(bingo_queue._confirm_timeout_job(ctx))
-    assert fake.submission_status(a) == "failed"
-    assert fake.submission_status(b) == "confirming"     # next promoted
-    bingo_queue._PENDING_READ.pop(b, None)
 ```
+(The `_confirm_timeout_job` unit test lives in Task 5, where the function is defined.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_bingo_queue.py -q`
-Expected: FAIL — `confirm_button` / `_confirm_timeout_job` undefined.
+Expected: FAIL — `confirm_button` undefined (the confirm-button tests error; `_confirm_timeout_job` already exists from Task 5).
 
 - [ ] **Step 3: Implement**
 
 ```python
-# handlers/bingo_queue.py — add
-def _arm_confirm_timeout(context, submission_id):
-    """Arm the submitter-confirm 12h timeout for a 'confirming' submission."""
-    jq = getattr(context, "job_queue", None)
-    if jq is None:
-        return
-    jq.run_once(
-        _confirm_timeout_job,
-        when=config.BINGO_CONFIRM_TIMEOUT,
-        data={"submission_id": submission_id},
-        name=f"bingo:confirmwait:{submission_id}",
-    )
-
-
+# handlers/bingo_queue.py — add (reuse _arm_confirm_timeout / _confirm_timeout_job from Task 5; do NOT redefine them)
 async def confirm_button(update, context):
     query = update.callback_query
     await query.answer()
@@ -840,25 +860,6 @@ async def _start_verification(context, submission_id, line, handle, sheet_no):
         )
     await bingo._dm_subjects(context, submission_id, members)
     await bingo._finalize(context, submission_id)
-
-
-async def _confirm_timeout_job(context):
-    """12h submitter-confirm deadline: if still unconfirmed, fail and roll on."""
-    sid = context.job.data["submission_id"]
-    if storage.submission_status(sid) != "confirming":
-        return
-    storage.set_submission_status(sid, "failed")
-    sub = storage.submission_by_id(sid)
-    if sub is not None:
-        try:
-            await context.bot.send_message(
-                chat_id=sub["submitter_user_id"],
-                text="Your bingo confirmation timed out, so your slot passed to the "
-                     "next player. Submit again anytime to re-join the queue! 🔁",
-            )
-        except Exception:
-            pass
-    await maybe_kickoff(context)
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
