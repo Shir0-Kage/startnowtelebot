@@ -532,6 +532,46 @@ def set_bingo_closed():
         _conn.commit()
 
 
+def set_queue_open():
+    """Open the confirmation round (persisted). Idempotent."""
+    with _lock:
+        _conn.execute(
+            "INSERT OR IGNORE INTO bingo_flags (name, set_at) VALUES ('queue_open', ?)",
+            (_now_iso(),),
+        )
+        _conn.commit()
+
+
+def is_queue_open():
+    """True once the round has been opened (10 queued, or a facil command)."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT 1 FROM bingo_flags WHERE name = 'queue_open'"
+        ).fetchone()
+    return row is not None
+
+
+def all_bingo_submissions():
+    """Every submission row, earliest first (for the past-submission import)."""
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM bingo_submissions ORDER BY submitted_at, id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def requeue_submission(submission_id):
+    """Re-queue an existing submission in place: status -> 'queued', clear
+    verified_at, keep submitted_at and id (so its winning_members stay linked)."""
+    with _lock:
+        _conn.execute(
+            "UPDATE bingo_submissions SET status = 'queued', verified_at = NULL "
+            "WHERE id = ?",
+            (submission_id,),
+        )
+        _conn.commit()
+
+
 def active_submission(user_id):
     """The submitter's current pending submission as a dict, or None."""
     with _lock:

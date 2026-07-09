@@ -274,3 +274,29 @@ def test_active_slot_count_counts_confirming_pending_verified(store):
                              ("failed", 0)]:
         store.set_submission_status(s, status)
         assert store.active_slot_count() == expected
+
+
+# --- queue-open flag + import read/requeue --------------------------------
+
+def test_queue_open_flag_roundtrips(store):
+    assert store.is_queue_open() is False
+    store.set_queue_open()
+    assert store.is_queue_open() is True
+    store.set_queue_open()                       # idempotent
+    assert store.is_queue_open() is True
+
+
+def test_all_bingo_submissions_ordered_by_time(store):
+    a = store.start_bingo_submission(1, "a", 3)   # status 'pending', submitted_at now
+    b = store.start_bingo_submission(2, "b", 3)
+    rows = store.all_bingo_submissions()
+    ids = [r["id"] for r in rows]
+    assert set(ids) >= {a, b} and ids == sorted(ids)
+
+
+def test_requeue_submission_sets_queued_clears_verified(store):
+    s = store.start_bingo_submission(1, "a", 3)
+    store.set_submission_status(s, "verified", verified_at=store._now_iso())
+    store.requeue_submission(s)
+    row = store.submission_by_id(s)
+    assert row["status"] == "queued" and row["verified_at"] is None
