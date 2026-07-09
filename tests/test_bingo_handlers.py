@@ -86,6 +86,19 @@ def _text_update(user_id=100, username="alice", text=""):
     return upd
 
 
+def _confirm_keyboard_sent(ctx):
+    """True if any bot.send_message carried a bingoq:confirm: inline button."""
+    for c in ctx.bot.send_message.await_args_list:
+        rm = c.kwargs.get("reply_markup")
+        if rm is None:
+            continue
+        for row in rm.inline_keyboard:
+            for b in row:
+                if str(getattr(b, "callback_data", "")).startswith("bingoq:confirm:"):
+                    return True
+    return False
+
+
 def _tap_mode(bingo, ctx, uid, mode):
     q = AsyncMock()
     q.data = f"bingomode:{mode}"
@@ -295,12 +308,15 @@ def test_on_bingo_image_shows_preview_and_waits_for_confirmation(bingo, store, m
         == {"bingoocr:yes", "bingoocr:no"}
 
 
-def test_ocr_confirm_yes_queues_and_sends_short_confirmation(bingo, store, monkeypatch):
-    # New queue flow: a confirmed OCR read is enqueued, not verified straight
-    # away. With an empty queue and free slots it's immediately promoted to
-    # 'confirming', and because the line is fully recognised (all subjects have
-    # /started) the submitter gets the SHORT confirmation with a Confirm button.
-    # Subjects are NOT DM'd yet -- that happens only after the submitter confirms.
+def test_ocr_confirm_yes_queues_without_messaging_until_round_opens(bingo, store, monkeypatch):
+    # New round-open flow: a confirmed OCR read is ENQUEUED, and because the
+    # round stays closed after a single submit, it just sits 'queued' -- nothing
+    # is messaged to confirm and no timeout is armed. Only once the round opens
+    # (10 queued, or a facil command) is it promoted to 'confirming' and, since
+    # the line is fully recognised (all subjects have /started), the submitter
+    # gets the SHORT confirmation with a Confirm button. Subjects are never DM'd
+    # here -- that waits until the submitter confirms.
+    from handlers import bingo_queue
     store.allocate_bingo_sheet(100, "alice")
     for uid, h in [(1, "bob"), (2, "cara"), (3, "dan"), (4, "eve")]:
         store.mark_started(uid, h, h.title())
@@ -330,21 +346,35 @@ def test_ocr_confirm_yes_queues_and_sends_short_confirmation(bingo, store, monke
 
     _tap_ocr_confirm(bingo, ctx, 100, "yes")
 
-    # the submission is now 'confirming' (queued -> promoted), not 'pending', so
-    # active_submission (pending-only) sees nothing; find it via confirming.
+    # (a) round closed after a single submit -> the read is QUEUED, not promoted.
+    # confirming/active see nothing, no Confirm keyboard was sent, no timeout
+    # armed; only the "you're in the queue" DM went out.
+    queued = store.queued_in_order()
+    assert len(queued) == 1 and queued[0]["submitter_user_id"] == 100
+    assert store.confirming_submissions() == []
+    assert store.active_submission(100) is None
+    assert not _confirm_keyboard_sent(ctx)
+    assert any("queue" in c.kwargs.get("text", "").lower()
+               for c in ctx.bot.send_message.await_args_list)   # the in-queue DM
+    ctx.job_queue.run_once.assert_not_called()   # nothing armed while closed
+    assert ctx.user_data.get("bingo_ocr_pending") is None
+
+    # (b) opening the round promotes the read to 'confirming' and fires the SHORT
+    # confirmation (fully recognised -> a Confirm button).
+    store.set_queue_open()
+    asyncio.run(bingo_queue.maybe_kickoff(ctx))
+
     confirming = store.confirming_submissions()
     assert len(confirming) == 1 and confirming[0]["submitter_user_id"] == 100
     assert store.active_submission(100) is None
-    # the LAST DM to the submitter is the short confirmation with a Confirm button
     last = ctx.bot.send_message.await_args
     assert last.kwargs["chat_id"] == 100
     buttons = [b for row in last.kwargs["reply_markup"].inline_keyboard for b in row]
     assert any(b.callback_data.startswith("bingoq:confirm:") for b in buttons)
-    # subjects (chat_ids 1-4) are NOT messaged at submit time
+    # subjects (chat_ids 1-4) are still NOT messaged
     sent_chat_ids = {c.kwargs.get("chat_id") for c in ctx.bot.send_message.await_args_list}
     assert not (sent_chat_ids & {1, 2, 3, 4})
-    ctx.job_queue.run_once.assert_called_once()  # confirm-timeout armed
-    assert ctx.user_data.get("bingo_ocr_pending") is None
+    ctx.job_queue.run_once.assert_called_once()  # confirm-timeout armed on promote
 
 
 def test_ocr_confirm_no_arms_text_mode_with_prefilled_list(bingo, store, monkeypatch):
@@ -373,11 +403,13 @@ def test_ocr_confirm_no_arms_text_mode_with_prefilled_list(bingo, store, monkeyp
     assert "@bob" in sent_text and "R1C1" in sent_text
 
 
-def test_ocr_confirm_yes_no_line_still_queues_full_template(bingo, store, monkeypatch):
-    # New behavior: EVERY confirmed submission is queued -- even one with no
-    # recognised line. Once promoted to 'confirming', a not-fully-recognised read
-    # gets the FULL fill-in template (no Confirm button) so the submitter can fix
-    # blanks and resend. (The old "no bingo / no submission" path is gone.)
+def test_ocr_confirm_yes_no_line_queues_full_template_when_round_opens(bingo, store, monkeypatch):
+    # EVERY confirmed submission is queued -- even one with no recognised line --
+    # but nothing is messaged while the round is closed. Once the round opens and
+    # the read is promoted to 'confirming', a not-fully-recognised read gets the
+    # FULL fill-in template (no Confirm button) so the submitter can fix blanks
+    # and resend. (The old "no bingo / no submission" path is gone.)
+    from handlers import bingo_queue
     store.allocate_bingo_sheet(100, "alice")
 
     async def _empty(sheet_no, image_bytes):
@@ -394,11 +426,22 @@ def test_ocr_confirm_yes_no_line_still_queues_full_template(bingo, store, monkey
 
     _tap_ocr_confirm(bingo, ctx, 100, "yes")
 
-    # the submission is queued and promoted to 'confirming', not 'pending'
+    # (a) round closed -> queued only, no template/Confirm DM, no timeout armed
+    queued = store.queued_in_order()
+    assert len(queued) == 1 and queued[0]["submitter_user_id"] == 100
+    assert store.confirming_submissions() == []
+    assert store.active_submission(100) is None
+    assert not _confirm_keyboard_sent(ctx)
+    ctx.job_queue.run_once.assert_not_called()
+
+    # (b) opening the round promotes it and sends the full fill-in template with
+    # NO Confirm button (not fully recognised).
+    store.set_queue_open()
+    asyncio.run(bingo_queue.maybe_kickoff(ctx))
+
     confirming = store.confirming_submissions()
     assert len(confirming) == 1 and confirming[0]["submitter_user_id"] == 100
     assert store.active_submission(100) is None
-    # the confirmation DM is the full fill-in template with NO Confirm button
     last = ctx.bot.send_message.await_args
     assert last.kwargs["chat_id"] == 100
     assert "R1C1" in last.kwargs["text"]
@@ -417,17 +460,20 @@ def test_ocr_confirm_stale_button_is_a_no_op(bingo, store):
 
 # --- on_bingo_text full pipeline -> pending + DMs subjects ------------------
 
-def test_on_bingo_text_queues_and_sends_short_confirmation(bingo, store, monkeypatch):
-    # New queue flow for the text path: a typed submission is enqueued and, with
-    # a free slot, promoted to 'confirming'. All four tagged subjects have
-    # /started so the line is fully recognised -> the submitter gets the SHORT
-    # confirmation carrying the line and a Confirm button; subjects are not DM'd.
+def test_on_bingo_text_queues_without_messaging_until_round_opens(bingo, store, monkeypatch):
+    # New round-open flow for the text path: a typed submission is enqueued but,
+    # with the round closed after a single submit, it sits 'queued' -- nothing is
+    # messaged to confirm. Opening the round promotes it to 'confirming'; all four
+    # tagged subjects have /started so the line is fully recognised -> the
+    # submitter then gets the SHORT confirmation carrying the line and a Confirm
+    # button; subjects are never DM'd here.
     #
     # real Telegram usernames are 5-32 chars; use a roster with realistic
     # handles so normalize_handle doesn't reject a typed handle for being
     # too short (unlike the default short-handle roster used elsewhere,
     # which OCR mode can get away with since it never runs typed input
     # through normalize_handle).
+    from handlers import bingo_queue
     long_roster = {
         "AM1": [
             {"name": "Alice Tan", "handle": "alice", "email": "a@x.com", "addable": True},
@@ -460,40 +506,70 @@ def test_on_bingo_text_queues_and_sends_short_confirmation(bingo, store, monkeyp
     upd = _text_update(100, "alice", body)
     asyncio.run(bingo.on_bingo_text(upd, ctx))
 
-    # the submission is 'confirming' (queued -> promoted), not 'pending'
+    # (a) round closed after a single submit -> QUEUED, nothing messaged to
+    # confirm, no timeout armed; only the in-queue DM went out. The awaiting flag
+    # is cleared regardless.
+    queued = store.queued_in_order()
+    assert len(queued) == 1 and queued[0]["submitter_user_id"] == 100
+    assert store.confirming_submissions() == []
+    assert store.active_submission(100) is None
+    assert not _confirm_keyboard_sent(ctx)
+    assert any("queue" in c.kwargs.get("text", "").lower()
+               for c in ctx.bot.send_message.await_args_list)
+    ctx.job_queue.run_once.assert_not_called()
+    assert ctx.user_data.get("awaiting_bingo_text") is not True
+
+    # (b) opening the round promotes it and fires the SHORT confirmation carrying
+    # the line and a Confirm button.
+    store.set_queue_open()
+    asyncio.run(bingo_queue.maybe_kickoff(ctx))
+
     confirming = store.confirming_submissions()
     assert len(confirming) == 1 and confirming[0]["submitter_user_id"] == 100
     assert store.active_submission(100) is None
-    # the LAST DM to the submitter carries the line and a Confirm button
     last = ctx.bot.send_message.await_args
     assert last.kwargs["chat_id"] == 100
     assert "@bobby" in last.kwargs["text"]
     buttons = [b for row in last.kwargs["reply_markup"].inline_keyboard for b in row]
     assert any(b.callback_data.startswith("bingoq:confirm:") for b in buttons)
-    # subjects (chat_ids 1-4) are NOT messaged at submit time
+    # subjects (chat_ids 1-4) are still NOT messaged
     sent_chat_ids = {c.kwargs.get("chat_id") for c in ctx.bot.send_message.await_args_list}
     assert not (sent_chat_ids & {1, 2, 3, 4})
-    ctx.job_queue.run_once.assert_called_once()  # confirm-timeout armed
-    assert ctx.user_data.get("awaiting_bingo_text") is not True
+    ctx.job_queue.run_once.assert_called_once()  # confirm-timeout armed on promote
 
 
-def test_on_bingo_text_exact_match_miss_degrades_gracefully(bingo, store, monkeypatch):
-    # a typed handle that isn't on the roster is not fuzzy-rescued -- the
-    # cell just stays unmatched, same as a low-confidence OCR read. There's no
-    # recognised line, but the submission is still queued and the submitter gets
-    # the full fill-in template (via bot.send_message) to correct and resend.
+def test_on_bingo_text_exact_match_miss_queues_until_round_opens(bingo, store, monkeypatch):
+    # a typed handle that isn't on the roster is not fuzzy-rescued -- the cell
+    # just stays unmatched, same as a low-confidence OCR read. There's no
+    # recognised line, but the submission is still queued. While the round is
+    # closed nothing is messaged to confirm; opening the round then sends the
+    # full fill-in template (via bot.send_message) to correct and resend.
+    from handlers import bingo_queue
     store.allocate_bingo_sheet(100, "alice")
     monkeypatch.setattr(bingo.lines, "winning_lines", lambda matched, sub: [])
     ctx = _context()
     ctx.user_data["awaiting_bingo_text"] = True
     upd = _text_update(100, "alice", "R1C1: p - @ghostwriter")
     asyncio.run(bingo.on_bingo_text(upd, ctx))
+
+    # (a) round closed -> queued only; no confirmation/template DM, none armed
+    queued = store.queued_in_order()
+    assert len(queued) == 1 and queued[0]["submitter_user_id"] == 100
+    assert store.confirming_submissions() == []
+    assert store.active_submission(100) is None
+    assert not _confirm_keyboard_sent(ctx)
+    ctx.job_queue.run_once.assert_not_called()
+
+    # (b) opening the round promotes it; the submitter's DM is the NOT-fully-
+    # recognised FULL fill-in template: it carries the R1C1 template line and has
+    # NO confirm button (unlike the short "tap Confirm" DM sent when a line IS
+    # fully recognised).
+    store.set_queue_open()
+    asyncio.run(bingo_queue.maybe_kickoff(ctx))
+
     confirming = store.confirming_submissions()
     assert len(confirming) == 1 and confirming[0]["submitter_user_id"] == 100
     assert store.active_submission(100) is None
-    # the submitter's DM is the NOT-fully-recognised FULL fill-in template: it
-    # carries the R1C1 template line and has NO confirm button (unlike the short
-    # "tap Confirm" DM sent when a line IS fully recognised).
     to_submitter = [c for c in ctx.bot.send_message.await_args_list
                     if c.kwargs.get("chat_id") == 100]
     assert any("R1C1" in c.kwargs.get("text", "")
@@ -769,6 +845,7 @@ def test_failed_verification_promotes_next_queued(bingo, store, monkeypatch):
     monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
     monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
     ctx = _context()
+    store.set_queue_open()                                  # a pending sub implies the round is open
     asyncio.run(bingo._finalize(ctx, a, final=True))        # no yeses -> fail
     assert store.submission_status(a) == "failed"
     assert store.submission_status(b) == "confirming"       # next promoted

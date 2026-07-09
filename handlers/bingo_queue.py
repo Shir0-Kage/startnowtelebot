@@ -93,22 +93,28 @@ async def _send_confirmation(context, sub):
 
 
 async def enqueue(context, uid, handle, sheet_no, read):
-    """Record a submission into the queue and tell the user their position, then
-    fire kickoff if a slot is free (auto-batches once 10 are queued)."""
+    """Record a submission into the queue and tell the user their position. The
+    confirmation round opens automatically once BINGO_PRIZE_LIMIT are queued
+    (or earlier via a facil command)."""
     sid = storage.queue_submission(uid, handle, sheet_no)
     _PENDING_READ[sid] = {"read": read, "handle": handle, "sheet_no": sheet_no}
     position = len(storage.queued_in_order())
     await context.bot.send_message(
         chat_id=uid,
-        text=f"You're in the queue (#{position})! 📥 I'll message you if I need "
-             "you to confirm your squares — hang tight. 🙂",
+        text=f"You're in the queue (#{position})! 📥 I'll message you when it's "
+             "your turn to confirm your squares — hang tight. 🙂",
     )
+    if not storage.is_queue_open() and \
+            len(storage.queued_in_order()) >= config.BINGO_PRIZE_LIMIT:
+        storage.set_queue_open()
     await maybe_kickoff(context)
 
 
 async def maybe_kickoff(context):
     """Promote queued submissions into 'confirming' until the 10 in-flight slots
-    are full, sending each its confirmation message."""
+    are full — but only once the round is open (10 queued, or a facil command)."""
+    if not storage.is_queue_open():
+        return
     while storage.active_slot_count() < config.BINGO_PRIZE_LIMIT:
         queued = storage.queued_in_order()
         if not queued:
@@ -251,7 +257,9 @@ async def _start_verification(context, submission_id, line, handle, sheet_no):
 # ---------------------------------------------------------------------------
 
 async def close_round(context):
-    """Facil fallback: process whoever is queued even if fewer than 10."""
+    """Facil fallback: open the round now (even with fewer than 10 queued) and
+    process whoever is waiting."""
+    storage.set_queue_open()
     await maybe_kickoff(context)
 
 

@@ -97,6 +97,7 @@ class FakeStore:
     def __init__(self):
         self.rows = {}
         self._id = 0
+        self._open = False
     def queue_submission(self, uid, handle, sheet_no):
         self.rows = {i: r for i, r in self.rows.items()
                      if not (r["submitter_user_id"] == uid
@@ -123,6 +124,10 @@ class FakeStore:
         return self.rows[sid]["status"] if sid in self.rows else None
     def submission_by_id(self, sid):
         return dict(self.rows[sid]) if sid in self.rows else None
+    def is_queue_open(self):
+        return self._open
+    def set_queue_open(self):
+        self._open = True
 
 
 def test_kickoff_promotes_only_ten_earliest(monkeypatch):
@@ -132,6 +137,7 @@ def test_kickoff_promotes_only_ten_earliest(monkeypatch):
     monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
     for uid in range(1, 13):
         fake.queue_submission(uid, f"u{uid}", 1)
+    fake.set_queue_open()                                # round already open
     asyncio.run(bingo_queue.maybe_kickoff(_ctx()))
     assert bingo_queue._send_confirmation.await_count == 10
     assert fake.active_slot_count() == 10
@@ -144,6 +150,7 @@ def test_enqueue_replies_in_queue_then_kicks_off(monkeypatch):
     monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
     monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
     ctx = _ctx()
+    fake.set_queue_open()                                # round already open
     asyncio.run(bingo_queue.enqueue(ctx, 1, "alice", 1, {"cells": _cells({})}))
     text = ctx.bot.send_message.await_args_list[0].kwargs["text"]
     assert "queue" in text.lower()
@@ -156,6 +163,7 @@ def test_confirm_timeout_fails_and_promotes(monkeypatch):
     monkeypatch.setattr(bingo_queue, "storage", fake)
     a = fake.queue_submission(1, "a", 1); fake.set_submission_status(a, "confirming")
     b = fake.queue_submission(2, "b", 1)                 # queued behind
+    fake.set_queue_open()                                # a confirming sub implies open
     bingo_queue._PENDING_READ[b] = {"read": {"cells": _cells({})},
                                     "handle": "b", "sheet_no": 1}
     monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
@@ -269,3 +277,34 @@ def test_close_round_fires_with_fewer_than_ten(monkeypatch):
     asyncio.run(bingo_queue.close_round(_ctx()))
     assert bingo_queue._send_confirmation.await_count == 3
     assert fake.active_slot_count() == 3
+
+
+def test_maybe_kickoff_noops_until_round_open(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
+    for uid in range(1, 6):
+        fake.queue_submission(uid, f"u{uid}", 1)
+    asyncio.run(bingo_queue.maybe_kickoff(_ctx()))        # round closed
+    assert bingo_queue._send_confirmation.await_count == 0
+    fake.set_queue_open()
+    asyncio.run(bingo_queue.maybe_kickoff(_ctx()))        # now fires
+    assert bingo_queue._send_confirmation.await_count == 5
+
+
+def test_enqueue_opens_round_at_ten(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
+    ctx = _ctx()
+    for uid in range(1, 10):                              # 9 queued -> not open
+        asyncio.run(bingo_queue.enqueue(ctx, uid, f"u{uid}", 1, {"cells": _cells({})}))
+    assert fake.is_queue_open() is False
+    assert bingo_queue._send_confirmation.await_count == 0
+    asyncio.run(bingo_queue.enqueue(ctx, 10, "u10", 1, {"cells": _cells({})}))  # 10th
+    assert fake.is_queue_open() is True
+    assert bingo_queue._send_confirmation.await_count == 10
+    for sid in list(bingo_queue._PENDING_READ):
+        bingo_queue._PENDING_READ.pop(sid, None)
