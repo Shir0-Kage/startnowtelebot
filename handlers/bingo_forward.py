@@ -11,6 +11,7 @@ bingo_queue's in-flight queue/confirm state.
 """
 
 import logging
+from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -344,3 +345,49 @@ async def _release_results(context):
             pass
     for w in winners:
         storage.mark_admin_notified(w["winner_user_id"])   # WN sweep won't double-announce
+
+
+# ---------------------------------------------------------------------------
+# Broadcast start + registration + startup re-arm
+# ---------------------------------------------------------------------------
+
+async def begin_round(context):
+    """Start the forward round: set phase collecting, DM every card-holder to
+    forward their earliest card, and arm the 2-day deadline. Returns the count DM'd."""
+    storage.set_forward_phase("collecting")
+    n = 0
+    for a in storage.all_bingo_allocations():
+        try:
+            await context.bot.send_message(chat_id=a["user_id"],
+                text="📸 The Human Bingo prize round is on! Forward me the earliest "
+                     "bingo card you sent me and I'll check it. 🎉")
+            n += 1
+        except Exception:
+            pass
+    if getattr(context, "job_queue", None) is not None:
+        context.job_queue.run_once(_forward_timeout_job,
+            when=config.FORWARD_ROUND_WINDOW.total_seconds(),
+            name="bingo:forward_deadline")
+    return n
+
+
+def register(app):
+    from telegram.ext import CallbackQueryHandler
+    app.add_handler(CallbackQueryHandler(confirm_button, pattern=r"^bingofwd:confirm:"))
+
+
+def rearm(app):
+    """Re-arm the 2-day deadline if a collecting round was in progress at restart."""
+    jq = app.job_queue
+    if jq is None or storage.forward_phase() != "collecting":
+        return
+    started = storage.forward_started_at()
+    from zoneinfo import ZoneInfo
+    try:
+        base = datetime.fromisoformat(started)
+    except (ValueError, TypeError):
+        base = datetime.now(config.TIMEZONE)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=ZoneInfo("Asia/Singapore"))
+    delay = (base + config.FORWARD_ROUND_WINDOW - datetime.now(config.TIMEZONE)).total_seconds()
+    jq.run_once(_forward_timeout_job, when=max(delay, 5), name="bingo:forward_deadline")

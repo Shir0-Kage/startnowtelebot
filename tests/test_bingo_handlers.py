@@ -912,6 +912,45 @@ def test_import_bingo_queue_command_is_facil_only_and_reports(bingo, store, monk
     assert "3" in sent and "queue" in sent.lower()
 
 
+# --- /start_forward_round facil command -------------------------------------
+
+def test_start_forward_round_command_is_facil_only_and_reports(bingo, store, monkeypatch):
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "begin_round", AsyncMock(return_value=7))
+    # is_facilitator is async in utils.auth; make the caller a facil
+    monkeypatch.setattr("handlers.bingo.is_facilitator", AsyncMock(return_value=True), raising=False)
+    from utils import auth
+    monkeypatch.setattr(auth, "is_facilitator", AsyncMock(return_value=True))
+    ctx = _context()
+    upd = _text_update(100, "aria", "/start_forward_round")
+    asyncio.run(bingo.start_forward_round(upd, ctx))
+    bingo_forward.begin_round.assert_awaited_once()
+    sent = upd.effective_message.reply_text.await_args.args[0]
+    assert "7" in sent
+
+
+# --- on_bingo_text routes forward-round resends before the live queue -------
+
+def test_on_bingo_text_forward_collecting_routes_to_forward_resend(bingo, store, monkeypatch):
+    # A collecting-phase user who already has a 'fwd_confirming' row is routed to
+    # bingo_forward.on_resend, and must NOT fall through to the live-queue path.
+    from handlers import bingo_forward, bingo_queue
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    monkeypatch.setattr(bingo_forward, "on_resend", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "on_resend", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "enqueue", AsyncMock())
+    store.allocate_bingo_sheet(100, "alice")
+    store.set_forward_phase("collecting")
+    store.queue_forwarded_submission(
+        100, "alice", store.get_bingo_sheet(100), "2026-01-01T09:00:00")
+    ctx = _context()
+    upd = _text_update(100, "alice", "R1C1: p - @bob")
+    asyncio.run(bingo.on_bingo_text(upd, ctx))
+    bingo_forward.on_resend.assert_awaited_once()   # forward resend path taken
+    bingo_queue.on_resend.assert_not_awaited()      # NOT the live-queue resend
+    bingo_queue.enqueue.assert_not_awaited()        # NOT a fresh live submission
+
+
 # --- DM the facil admin(s) about each winner --------------------------------
 
 def test_dm_admins_of_winner_dms_zzehao_and_marks(bingo, store, monkeypatch):

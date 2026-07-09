@@ -308,3 +308,21 @@ def test_maybe_release_noop_outside_verifying_phase(store, monkeypatch):
     store.set_forward_phase("collecting")
     asyncio.run(bingo_forward.maybe_release(_ctx()))
     bingo_forward._release_results.assert_not_awaited()
+
+
+# --- begin_round: broadcast + phase + deadline timer -----------------------
+
+def test_begin_round_dms_all_allocations_sets_phase_returns_count(store, monkeypatch):
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    for uid, h in [(1, "alice"), (2, "bob"), (3, "carol")]:
+        store.allocate_bingo_sheet(uid, h)
+    ctx = MagicMock(); ctx.bot = AsyncMock(); ctx.job_queue = MagicMock()
+    n = asyncio.run(bingo_forward.begin_round(ctx))
+    assert n == 3
+    assert store.forward_phase() == "collecting"
+    dmd = {c.kwargs["chat_id"] for c in ctx.bot.send_message.await_args_list}
+    assert dmd == {1, 2, 3}
+    # the 2-day deadline job is armed exactly once
+    ctx.job_queue.run_once.assert_called_once()
+    assert ctx.job_queue.run_once.call_args.kwargs["name"] == "bingo:forward_deadline"

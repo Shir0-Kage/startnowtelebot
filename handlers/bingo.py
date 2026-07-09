@@ -47,6 +47,8 @@ from utils.auth import facil_only
 # Module-level import is safe: bingo_queue imports handlers.bingo only lazily
 # (inside its functions), so there's no top-level circular import.
 from handlers import bingo_queue
+# Same safety: bingo_forward imports handlers.bingo only lazily.
+from handlers import bingo_forward
 
 log = logging.getLogger(__name__)
 
@@ -426,6 +428,13 @@ async def on_bingo_text(update, context):
     if chat is None or chat.type != "private":
         return
     uid = update.effective_user.id
+    if storage.forward_phase() == "collecting" and storage.fwd_confirming_for(uid):
+        sheet_no = storage.get_bingo_sheet(uid)
+        if sheet_no is not None:
+            read = bingo_text.parse_submission(
+                sheet_no, update.effective_message.text or "", _roster_index())
+            await bingo_forward.on_resend(context, uid, read)
+        return
     awaiting = context.user_data.get("awaiting_bingo_text")
     confirming = any(s["submitter_user_id"] == uid
                      for s in storage.confirming_submissions())
@@ -851,6 +860,8 @@ def rearm_bingo_timeouts(app):
     if jq is not None:
         jq.run_once(_notify_pending_winners_job, when=3, name="bingo:notify_winners")
 
+    bingo_forward.rearm(app)
+
 
 @facil_only
 async def close_bingo_round(update, context):
@@ -867,11 +878,19 @@ async def import_bingo_queue(update, context):
     )
 
 
+@facil_only
+async def start_forward_round(update, context):
+    n = await bingo_forward.begin_round(context)
+    await update.effective_message.reply_text(
+        f"Forward round started — messaged {n} card-holder(s) to forward their cards. 📸")
+
+
 def register(app):
     app.add_handler(CommandHandler("get_bingo", get_bingo))
     app.add_handler(CommandHandler("submit_bingo", submit_bingo))
     app.add_handler(CommandHandler("close_bingo_round", close_bingo_round))
     app.add_handler(CommandHandler("import_bingo_queue", import_bingo_queue))
+    app.add_handler(CommandHandler("start_forward_round", start_forward_round))
     app.add_handler(CallbackQueryHandler(confirm_button, pattern=r"^bingoconf:"))
     app.add_handler(CallbackQueryHandler(bingo_mode_button, pattern=r"^bingomode:"))
     app.add_handler(CallbackQueryHandler(bingo_ocr_confirm_button, pattern=r"^bingoocr:"))
@@ -893,4 +912,11 @@ def register(app):
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
         on_bingo_text,
     ), group=1)
+    # forwarded filled cards for the prize round -- group=1 so it doesn't shadow
+    # (or get shadowed by) the on_bingo_image handler in the default group.
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.FORWARDED & (filters.PHOTO | filters.Document.IMAGE),
+        bingo_forward.on_forwarded_card,
+    ), group=1)
     bingo_queue.register(app)
+    bingo_forward.register(app)

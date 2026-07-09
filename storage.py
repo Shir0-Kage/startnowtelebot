@@ -507,6 +507,23 @@ def get_bingo_sheet(user_id):
     return row["sheet_no"] if row else None
 
 
+def all_bingo_allocations():
+    """Every user who was dealt a card (for the forward-round broadcast)."""
+    with _lock:
+        rows = _conn.execute("SELECT * FROM bingo_allocation").fetchall()
+    return [dict(r) for r in rows]
+
+
+def fwd_confirming_for(user_id):
+    """This user's in-progress forwarded submission, or None."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT * FROM bingo_submissions WHERE submitter_user_id = ? "
+            "AND status = 'fwd_confirming' ORDER BY id DESC LIMIT 1",
+            (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def user_id_for_handle(handle):
     """Resolve a @handle to a user_id via started_users (they must have /started
     for us to reach them). Returns None if no such user is known."""

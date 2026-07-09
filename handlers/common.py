@@ -42,6 +42,7 @@ HELP_TEXT = (
     "/sync_year_ones — DM join links to Year 1s added to the sheet mid-programme\n"
     "/roster_status &lt;OG&gt; — (DM me) see who's in the group / waiting / not reachable\n"
     "/import_bingo_queue — re-queue everyone who's already submitted\n"
+    "/start_forward_round — DM card-holders to forward their cards for the prize round\n"
 )
 
 
