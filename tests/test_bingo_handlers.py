@@ -867,3 +867,45 @@ def test_import_bingo_queue_command_is_facil_only_and_reports(bingo, store, monk
     bingo_queue.import_queue.assert_awaited_once()
     sent = upd.effective_message.reply_text.await_args.args[0]
     assert "3" in sent and "queue" in sent.lower()
+
+
+# --- DM the facil admin(s) about each winner --------------------------------
+
+def test_dm_admins_of_winner_dms_zzehao_and_marks(bingo, store, monkeypatch):
+    store.mark_started(999, "zzehao", "Zhou")            # admin has /started
+    monkeypatch.setattr(bingo.config, "FACILITATOR_HANDLES", {"zzehao"})
+    store.allocate_bingo_sheet(1, "alice")
+    sub = store.start_bingo_submission(1, "alice", 1)
+    store.claim_bingo_prize(1, "alice", sub)
+    ctx = _context()
+    asyncio.run(bingo._dm_admins_of_winner(
+        ctx, {"winner_user_id": 1, "handle": "alice", "claim_no": 1}))
+    dm = [c for c in ctx.bot.send_message.await_args_list if c.kwargs.get("chat_id") == 999]
+    assert dm and "alice" in dm[0].kwargs["text"]
+    assert store.winners_pending_admin_notice() == []    # marked
+
+
+def test_dm_admins_no_recipient_does_not_mark(bingo, store, monkeypatch):
+    monkeypatch.setattr(bingo.config, "FACILITATOR_HANDLES", {"nobody_started"})
+    store.allocate_bingo_sheet(1, "alice")
+    sub = store.start_bingo_submission(1, "alice", 1)
+    store.claim_bingo_prize(1, "alice", sub)
+    ctx = _context()
+    asyncio.run(bingo._dm_admins_of_winner(
+        ctx, {"winner_user_id": 1, "handle": "alice", "claim_no": 1}))
+    ctx.bot.send_message.assert_not_awaited()
+    assert [w["winner_user_id"] for w in store.winners_pending_admin_notice()] == [1]  # NOT marked
+
+
+def test_notify_pending_winners_job_sweeps_all(bingo, store, monkeypatch):
+    store.mark_started(999, "zzehao", "Zhou")
+    monkeypatch.setattr(bingo.config, "FACILITATOR_HANDLES", {"zzehao"})
+    for uid, h in [(1, "alice"), (2, "bob")]:
+        store.allocate_bingo_sheet(uid, h)
+        sub = store.start_bingo_submission(uid, h, 1)
+        store.claim_bingo_prize(uid, h, sub)
+    ctx = _context(); ctx.job = MagicMock()
+    asyncio.run(bingo._notify_pending_winners_job(ctx))
+    assert store.winners_pending_admin_notice() == []    # all marked
+    dmd = {c.kwargs.get("chat_id") for c in ctx.bot.send_message.await_args_list}
+    assert dmd == {999}                                  # both winners announced to zzehao

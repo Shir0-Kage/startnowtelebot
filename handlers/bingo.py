@@ -638,6 +638,44 @@ async def _finalize(context, submission_id, final=False):
     await _award(context, submission_id)
 
 
+def _admin_recipient_ids():
+    """Resolve the facil-admin handles (always includes @zzehao) to user_ids we
+    can DM. A handle whose owner hasn't /started the bot resolves to None and is
+    dropped (we can't DM them)."""
+    ids = set()
+    for handle in config.FACILITATOR_HANDLES:
+        uid = storage.user_id_for_handle(handle)
+        if uid is not None:
+            ids.add(uid)
+    return ids
+
+
+async def _dm_admins_of_winner(context, winner):
+    """DM the facil admin(s) that a bingo prize was claimed, then mark this winner
+    as announced. If no admin is reachable, send nothing and leave it unmarked so
+    the next startup sweep retries."""
+    recipients = _admin_recipient_ids()
+    if not recipients:
+        log.warning("no reachable facil admin to announce bingo winner %s",
+                    winner.get("winner_user_id"))
+        return
+    handle = winner.get("handle") or "?"
+    text = (f"🏆 Bingo prize #{winner['claim_no']}/{config.BINGO_PRIZE_LIMIT} "
+            f"claimed by @{handle}.")
+    for uid in recipients:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+        except Exception as exc:
+            log.warning("couldn't DM admin %s about bingo winner: %s", uid, exc)
+    storage.mark_admin_notified(winner["winner_user_id"])
+
+
+async def _notify_pending_winners_job(context):
+    """Startup catch-up: DM the admin(s) about every winner not yet announced."""
+    for winner in storage.winners_pending_admin_notice():
+        await _dm_admins_of_winner(context, winner)
+
+
 async def _award(context, submission_id):
     members = storage.winning_members(submission_id)
     if not members:
@@ -693,6 +731,11 @@ async def _award(context, submission_id):
         )
     except Exception as exc:
         log.warning("couldn't DM bingo winner %s: %s", submitter_id, exc)
+
+    await _dm_admins_of_winner(
+        context,
+        {"winner_user_id": submitter_id, "handle": submitter_handle, "claim_no": claim_no},
+    )
 
 
 def _cancel_job(context, name):
@@ -794,6 +837,9 @@ def rearm_bingo_timeouts(app):
         rearmed += 1
     log.info("re-armed %d bingo confirmation timeout(s)", rearmed)
     bingo_queue.rearm_confirm_timeouts(app)
+
+    if jq is not None:
+        jq.run_once(_notify_pending_winners_job, when=3, name="bingo:notify_winners")
 
 
 @facil_only
