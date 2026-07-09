@@ -300,3 +300,23 @@ def test_requeue_submission_sets_queued_clears_verified(store):
     store.requeue_submission(s)
     row = store.submission_by_id(s)
     assert row["status"] == "queued" and row["verified_at"] is None
+
+
+# --- admin notification tracking -------------------------------------------
+
+def test_admin_notified_lifecycle(store):
+    store.allocate_bingo_sheet(1, "alice")
+    sub = store.start_bingo_submission(1, "alice", 1)
+    claim = store.claim_bingo_prize(1, "alice", sub)
+    assert claim == 1
+    pending = store.winners_pending_admin_notice()
+    assert [w["winner_user_id"] for w in pending] == [1]
+    store.mark_admin_notified(1)
+    assert store.winners_pending_admin_notice() == []
+    store.mark_admin_notified(1)                 # idempotent no-op
+    assert store.winners_pending_admin_notice() == []
+
+
+def test_bingo_prizes_has_admin_notified_column(store):
+    cols = [r[1] for r in store._conn.execute("PRAGMA table_info(bingo_prizes)")]
+    assert "admin_notified_at" in cols

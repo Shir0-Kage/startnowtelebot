@@ -147,7 +147,8 @@ CREATE TABLE IF NOT EXISTS bingo_prizes (
     submission_id  INTEGER,
     claim_no       INTEGER,
     claimed_at     TEXT,
-    posted_at      TEXT            -- set once the channel post succeeds
+    posted_at      TEXT,           -- set once the channel post succeeds
+    admin_notified_at TEXT         -- set once the admin(s) were DM'd about this winner
 );
 
 -- Single-row flags (e.g. 'closed' once the 10th prize is claimed).
@@ -182,6 +183,10 @@ def init_db():
         cols = [r[1] for r in _conn.execute("PRAGMA table_info(attendance)")]
         if "answer" not in cols:
             _conn.execute("ALTER TABLE attendance ADD COLUMN answer TEXT")
+        # migrate older DBs created before the 'admin_notified_at' column existed
+        pcols = [r[1] for r in _conn.execute("PRAGMA table_info(bingo_prizes)")]
+        if "admin_notified_at" not in pcols:
+            _conn.execute("ALTER TABLE bingo_prizes ADD COLUMN admin_notified_at TEXT")
         _conn.commit()
 
 
@@ -762,6 +767,27 @@ def mark_prize_posted(user_id):
             "UPDATE bingo_prizes SET posted_at = ? "
             "WHERE winner_user_id = ? AND posted_at IS NULL",
             (_now_iso(), user_id),
+        )
+        _conn.commit()
+
+
+def winners_pending_admin_notice():
+    """Winners not yet DM'd to the facil admin(s), earliest prize first."""
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM bingo_prizes WHERE admin_notified_at IS NULL "
+            "ORDER BY claim_no"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_admin_notified(winner_user_id):
+    """Record that the admin(s) were told about this winner (once)."""
+    with _lock:
+        _conn.execute(
+            "UPDATE bingo_prizes SET admin_notified_at = ? "
+            "WHERE winner_user_id = ? AND admin_notified_at IS NULL",
+            (_now_iso(), winner_user_id),
         )
         _conn.commit()
 
