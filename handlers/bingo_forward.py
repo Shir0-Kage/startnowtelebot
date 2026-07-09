@@ -131,3 +131,99 @@ async def on_forwarded_card(update, context):
         )
 
     await _send_confirmation(context, sid, uid, sheet_no)
+
+
+def _rebuild_pending(sid):
+    """Try to repopulate _PENDING_READ[sid] from the persisted winning line
+    (mirrors bingo_queue._rebuild_pending, using THIS module's _PENDING_READ).
+    Returns the pending dict or None."""
+    members = storage.winning_members(sid)
+    if not members:
+        return None
+    sub = storage.submission_by_id(sid)
+    if sub is None:
+        return None
+    read = {"cells": [{"row": m["row"], "col": m["col"], "handle": m["handle"],
+                       "score": 100.0} for m in members]}
+    pending = {"read": read, "handle": sub.get("submitter_handle") or "",
+               "sheet_no": sub["sheet_no"]}
+    _PENDING_READ[sid] = pending
+    return pending
+
+
+async def _mark_ready(context, submission_id, line, sheet_no):
+    """A fully-recognised line was confirmed (via button or resend): record the
+    winning members and flip the entry to 'ready', then DM the submitter.
+    Unlike bingo_queue._start_verification, there's no per-tagged-person
+    verification here -- results are released together once the batch closes."""
+    from handlers import bingo               # lazy: avoid import cycle
+    from data import bingo_templates as templates
+    members = [{
+        "row": r, "col": c, "handle": h,
+        "prompt": templates.prompt_for(sheet_no, r, c),
+        "target_user_id": storage.user_id_for_handle(h),
+    } for (r, c, h) in line]
+    storage.record_winning_members(submission_id, members)
+    storage.set_forward_ready(submission_id)
+    sub = storage.submission_by_id(submission_id)
+    if sub is not None:
+        try:
+            await context.bot.send_message(
+                chat_id=sub["submitter_user_id"],
+                text="You're in — results will be released together soon. 🎉",
+            )
+        except Exception:
+            pass
+    _PENDING_READ.pop(submission_id, None)
+
+
+async def confirm_button(update, context):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, _, sid_s = query.data.split(":")
+        sid = int(sid_s)
+    except (ValueError, AttributeError):
+        return
+    if storage.submission_status(sid) != "fwd_confirming":
+        return                                    # stale / already resolved
+    pending = _PENDING_READ.get(sid)
+    if pending is None:
+        pending = _rebuild_pending(sid)
+    if pending is None:
+        try:
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="I lost track of your card — please re-forward your filled "
+                     "bingo card and I'll check it. 🔁",
+            )
+        except Exception:
+            pass
+        return
+    res = bingo_queue.evaluate(pending["read"], pending["handle"], pending["sheet_no"])
+    if not res["fully_recognised"]:
+        return                                    # full-template/resend path governs
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _mark_ready(context, sid, res["line"], pending["sheet_no"])
+
+
+async def on_resend(context, uid, read):
+    """Handle a re-forwarded card from a submitter in the 'fwd_confirming' phase.
+    Returns True if the user was in that phase (message consumed), else False."""
+    mine = [s for s in storage.all_bingo_submissions()
+            if s["submitter_user_id"] == uid and s["status"] == "fwd_confirming"]
+    if not mine:
+        return False
+    sub = mine[0]
+    handle = sub.get("submitter_handle") or ""
+    sheet_no = sub["sheet_no"]
+    _PENDING_READ[sub["id"]] = {"read": read, "handle": handle, "sheet_no": sheet_no}
+    res = bingo_queue.evaluate(read, handle, sheet_no)
+    if res["fully_recognised"]:
+        await _mark_ready(context, sub["id"], res["line"], sheet_no)
+    else:
+        await _send_confirmation(context, sub["id"], uid, sheet_no)  # re-show full + flags
+    return True
