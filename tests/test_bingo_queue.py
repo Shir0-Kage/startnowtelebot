@@ -128,6 +128,8 @@ class FakeStore:
         return self._open
     def set_queue_open(self):
         self._open = True
+    def winning_members(self, sid):
+        return []                             # default: no persisted winning line
 
 
 def test_kickoff_promotes_only_ten_earliest(monkeypatch):
@@ -291,6 +293,37 @@ def test_maybe_kickoff_noops_until_round_open(monkeypatch):
     fake.set_queue_open()
     asyncio.run(bingo_queue.maybe_kickoff(_ctx()))        # now fires
     assert bingo_queue._send_confirmation.await_count == 5
+
+
+def test_read_from_members_rebuilds_cells(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    fake.winning_members = lambda sid: [
+        {"row": 0, "col": 0, "handle": "alice", "prompt": "p", "target_user_id": 1},
+        {"row": 0, "col": 1, "handle": "bob", "prompt": "p", "target_user_id": 2}]
+    read = bingo_queue._read_from_members(5)
+    assert {(c["row"], c["col"], c["handle"]) for c in read["cells"]} == \
+        {(0, 0, "alice"), (0, 1, "bob")}
+    fake.winning_members = lambda sid: []
+    assert bingo_queue._read_from_members(5) is None
+
+
+def test_confirm_button_rebuilds_from_members_after_restart(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    monkeypatch.setattr(fake, "user_id_for_handle", lambda h: 1, raising=False)
+    sid = fake.queue_submission(1, "submitter", 1)
+    fake.set_submission_status(sid, "confirming")
+    fake.winning_members = lambda s: [
+        {"row": 0, "col": c, "handle": h} for c, h in
+        [(0, "alice"), (1, "bob"), (2, "carol"), (3, "dan"), (4, "eve")]]
+    bingo_queue._PENDING_READ.pop(sid, None)             # simulate lost read
+    monkeypatch.setattr(bingo_queue, "_start_verification", AsyncMock())
+    q = AsyncMock(); q.data = f"bingoq:confirm:{sid}"; q.from_user = MagicMock(id=1)
+    upd = MagicMock(); upd.callback_query = q
+    asyncio.run(bingo_queue.confirm_button(upd, _ctx()))
+    bingo_queue._start_verification.assert_awaited_once()  # rebuilt, not "resend"
+    bingo_queue._PENDING_READ.pop(sid, None)
 
 
 def test_enqueue_opens_round_at_ten(monkeypatch):

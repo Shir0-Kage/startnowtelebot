@@ -43,6 +43,33 @@ def evaluate(read, submitter_handle, sheet_no):
             "unreachable": unreachable}
 
 
+def _read_from_members(submission_id):
+    """Rebuild a minimal read from a submission's recorded winning line, or None.
+    Used to seed _PENDING_READ for imported past submissions and as a restart
+    fallback (winning_members is persisted; _PENDING_READ is in-memory)."""
+    members = storage.winning_members(submission_id)
+    if not members:
+        return None
+    cells = [{"row": m["row"], "col": m["col"], "handle": m["handle"], "score": 100.0}
+             for m in members]
+    return {"cells": cells}
+
+
+def _rebuild_pending(sid):
+    """Try to repopulate _PENDING_READ[sid] from the persisted winning line.
+    Returns the pending dict or None."""
+    read = _read_from_members(sid)
+    if read is None:
+        return None
+    sub = storage.submission_by_id(sid)
+    if sub is None:
+        return None
+    pending = {"read": read, "handle": sub.get("submitter_handle") or "",
+               "sheet_no": sub["sheet_no"]}
+    _PENDING_READ[sid] = pending
+    return pending
+
+
 def _confirm_keyboard(submission_id):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Confirm",
@@ -58,9 +85,11 @@ async def _send_confirmation(context, sub):
     uid = sub["submitter_user_id"]
     pending = _PENDING_READ.get(sid)
     if pending is None:
-        # in-memory read lost (e.g. restart between kickoff and confirm): ask the
-        # submitter to resend so we can rebuild it, instead of leaving them with
-        # no confirmation message at all.
+        pending = _rebuild_pending(sid)
+    if pending is None:
+        # in-memory read lost (e.g. restart between kickoff and confirm) and no
+        # persisted winning line to rebuild from: ask the submitter to resend so
+        # we can rebuild it, instead of leaving them with no confirmation at all.
         log.warning("no pending read for submission %s; can't send confirmation", sid)
         try:
             await context.bot.send_message(
@@ -170,10 +199,13 @@ async def confirm_button(update, context):
         return                                    # stale / already resolved
     pending = _PENDING_READ.get(sid)
     if pending is None:
-        # _PENDING_READ is in-memory and empty after a restart. Rather than
-        # silently no-op'ing the tap, ask the submitter to resend so we can
-        # re-derive and check their card (rearm_confirm_timeouts re-arms the
-        # timeout but can't reconstruct the read).
+        pending = _rebuild_pending(sid)
+    if pending is None:
+        # _PENDING_READ is in-memory and empty after a restart, and there's no
+        # persisted winning line to rebuild from either. Rather than silently
+        # no-op'ing the tap, ask the submitter to resend so we can re-derive and
+        # check their card (rearm_confirm_timeouts re-arms the timeout but can't
+        # reconstruct the read).
         try:
             await context.bot.send_message(
                 chat_id=query.from_user.id,
