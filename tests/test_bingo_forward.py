@@ -170,3 +170,55 @@ def test_on_resend_returns_false_for_unrelated_user(store, monkeypatch):
     handled = asyncio.run(bingo_forward.on_resend(
         _ctx(), 999, {"cells": _cells(_TOP_ROW)}))
     assert handled is False
+
+
+# --- collection close + verification kickoff -------------------------------
+
+def test_maybe_close_collection_closes_at_target(store, monkeypatch):
+    import config
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    monkeypatch.setattr(bingo_forward, "kickoff_verification", AsyncMock())
+    store.set_forward_phase("collecting")
+    for uid in range(1, config.FORWARD_ROUND_TARGET + 1):
+        store.queue_forwarded_submission(uid, f"u{uid}", 1, "2026-01-01T09:00:00")
+    asyncio.run(bingo_forward.maybe_close_collection(_ctx()))
+    assert store.forward_phase() == "verifying"
+    bingo_forward.kickoff_verification.assert_awaited_once()
+
+
+def test_maybe_close_collection_noop_below_target(store, monkeypatch):
+    import config
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    monkeypatch.setattr(bingo_forward, "kickoff_verification", AsyncMock())
+    store.set_forward_phase("collecting")
+    for uid in range(1, config.FORWARD_ROUND_TARGET):        # one short
+        store.queue_forwarded_submission(uid, f"u{uid}", 1, "2026-01-01T09:00:00")
+    asyncio.run(bingo_forward.maybe_close_collection(_ctx()))
+    assert store.forward_phase() == "collecting"
+    bingo_forward.kickoff_verification.assert_not_awaited()
+
+
+def test_kickoff_verification_promotes_ten_earliest_of_twelve(store, monkeypatch):
+    import config
+    from handlers import bingo, bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    monkeypatch.setattr(bingo, "_dm_subjects", AsyncMock())
+    monkeypatch.setattr(bingo, "_finalize", AsyncMock())
+    store.set_forward_phase("verifying")
+    sids = []
+    for i in range(12):
+        sid = store.queue_forwarded_submission(
+            200 + i, f"u{i}", 1, f"2026-01-01T09:00:{i:02d}")
+        store.set_forward_ready(sid)
+        sids.append(sid)
+    ctx = _ctx()
+    ctx.job_queue = MagicMock()
+    asyncio.run(bingo_forward.kickoff_verification(ctx))
+    promoted = [sid for sid in sids if store.submission_status(sid) == "pending"]
+    still_ready = [sid for sid in sids if store.submission_status(sid) == "ready"]
+    assert promoted == sids[:config.BINGO_PRIZE_LIMIT]
+    assert still_ready == sids[config.BINGO_PRIZE_LIMIT:]
+    assert bingo._dm_subjects.await_count == config.BINGO_PRIZE_LIMIT
+    assert bingo._finalize.await_count == config.BINGO_PRIZE_LIMIT

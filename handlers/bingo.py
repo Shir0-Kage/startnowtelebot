@@ -633,6 +633,9 @@ async def _finalize(context, submission_id, final=False):
         await _notify_submitter_failed(context, submission_id)
         from handlers import bingo_queue
         await bingo_queue.maybe_kickoff(context)
+        if storage.forward_phase() == "verifying":
+            from handlers import bingo_forward
+            await bingo_forward.kickoff_verification(context)
         return
 
     await _award(context, submission_id)

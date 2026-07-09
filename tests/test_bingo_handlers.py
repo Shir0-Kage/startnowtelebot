@@ -852,6 +852,27 @@ def test_failed_verification_promotes_next_queued(bingo, store, monkeypatch):
     bingo_queue._PENDING_READ.pop(b, None)
 
 
+def test_failed_verification_promotes_next_ready_forward(bingo, store, monkeypatch):
+    # Forward round in 'verifying' phase: `a` is a forward submission already in
+    # tagged-people verification ('pending') with an all-unreachable line -> it
+    # FAILS. A 'ready' forward submission `b` sits behind it and should be
+    # promoted to 'pending' by the freed slot.
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)   # rebind, like bingo_queue above
+    store.set_forward_phase("verifying")
+    a = store.queue_forwarded_submission(1, "a", 1, "2026-01-01T09:00:00")
+    store.set_submission_status(a, "pending")
+    store.record_winning_members(a, [
+        {"row": 0, "col": c, "handle": h, "prompt": "p", "target_user_id": None}
+        for c, h in enumerate(["v", "w", "x", "y", "z"])])
+    b = store.queue_forwarded_submission(2, "b", 1, "2026-01-01T09:00:01")
+    store.set_forward_ready(b)
+    ctx = _context()
+    asyncio.run(bingo._finalize(ctx, a, final=True))        # no yeses -> fail
+    assert store.submission_status(a) == "failed"
+    assert store.submission_status(b) == "pending"           # next ready promoted
+
+
 # --- /import_bingo_queue facil command --------------------------------------
 
 def test_import_bingo_queue_command_is_facil_only_and_reports(bingo, store, monkeypatch):

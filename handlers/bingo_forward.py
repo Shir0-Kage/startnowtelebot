@@ -15,6 +15,7 @@ import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import bingo_text
+import config
 import storage
 from handlers import bingo_queue
 from setup import sheets
@@ -131,6 +132,7 @@ async def on_forwarded_card(update, context):
         )
 
     await _send_confirmation(context, sid, uid, sheet_no)
+    await maybe_close_collection(context)
 
 
 def _rebuild_pending(sid):
@@ -227,3 +229,71 @@ async def on_resend(context, uid, read):
     else:
         await _send_confirmation(context, sub["id"], uid, sheet_no)  # re-show full + flags
     return True
+
+
+# ---------------------------------------------------------------------------
+# Collection close + verification kickoff (mirrors bingo_queue.maybe_kickoff /
+# _start_verification, but over the forward round's 'ready' rows).
+# ---------------------------------------------------------------------------
+
+async def maybe_close_collection(context):
+    """Close the collecting phase once FORWARD_ROUND_TARGET entries are in
+    (fwd_confirming + ready), then kick off verification of the earliest-ready
+    batch."""
+    if storage.forward_phase() == "collecting" and \
+            storage.forward_entry_count() >= config.FORWARD_ROUND_TARGET:
+        await close_collection(context)
+
+
+async def close_collection(context):
+    """Facil fallback / 2-day deadline: close collecting now and start
+    verifying whoever is ready."""
+    if storage.forward_phase() == "collecting":
+        storage.set_forward_phase("verifying")
+    await kickoff_verification(context)
+
+
+async def kickoff_verification(context):
+    """Promote 'ready' forward submissions into verification until the
+    BINGO_PRIZE_LIMIT in-flight slots are full."""
+    while storage.active_forward_verifying_count() < config.BINGO_PRIZE_LIMIT:
+        ready = storage.ready_in_order()
+        if not ready:
+            return
+        await _start_verification(context, ready[0])
+
+
+async def _start_verification(context, sub):
+    """A 'ready' forward submission is promoted: hand off to the existing
+    tagged-people pipeline (flip to 'pending', DM subjects, arm the 12h
+    timeout, evaluate). Members were already recorded at confirm (FR-T3), so
+    just read them back."""
+    from handlers import bingo                     # lazy: avoid import cycle
+    sid = sub["id"]
+    members = storage.winning_members(sid)
+    storage.set_submission_status(sid, "pending")
+    try:
+        await context.bot.send_message(
+            chat_id=sub["submitter_user_id"],
+            text="You're in — results will be released together soon. 🎊",
+        )
+    except Exception:
+        pass
+    if getattr(context, "job_queue", None) is not None:
+        context.job_queue.run_once(
+            bingo._confirmation_timeout,
+            when=config.BINGO_CONFIRM_TIMEOUT,
+            data={"submission_id": sid},
+            name=f"bingo:timeout:{sid}",
+        )
+    await bingo._dm_subjects(context, sid, members)
+    await bingo._finalize(context, sid)
+    # handed off to the tagged-people pipeline; this module no longer needs the
+    # cached read, so evict it to bound _PENDING_READ growth.
+    _PENDING_READ.pop(sid, None)
+
+
+async def _forward_timeout_job(context):
+    """2-day forward-round deadline: close collecting even if under target."""
+    if storage.forward_phase() == "collecting":
+        await close_collection(context)
