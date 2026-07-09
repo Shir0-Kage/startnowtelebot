@@ -41,6 +41,7 @@ HELP_TEXT = (
     "/add_year_ones — add this group's Year 1s (from the sheet)\n"
     "/sync_year_ones — DM join links to Year 1s added to the sheet mid-programme\n"
     "/roster_status &lt;OG&gt; — (DM me) see who's in the group / waiting / not reachable\n"
+    "/import_bingo_queue — re-queue everyone who's already submitted\n"
 )
 
 

@@ -802,10 +802,20 @@ async def close_bingo_round(update, context):
     await update.effective_message.reply_text("Kicked off the bingo queue. 🚀")
 
 
+@facil_only
+async def import_bingo_queue(update, context):
+    n = await bingo_queue.import_queue(context)
+    await update.effective_message.reply_text(
+        f"Imported {n} player(s) into the bingo queue — checking the earliest 10 "
+        "now. 🎬"
+    )
+
+
 def register(app):
     app.add_handler(CommandHandler("get_bingo", get_bingo))
     app.add_handler(CommandHandler("submit_bingo", submit_bingo))
     app.add_handler(CommandHandler("close_bingo_round", close_bingo_round))
+    app.add_handler(CommandHandler("import_bingo_queue", import_bingo_queue))
     app.add_handler(CallbackQueryHandler(confirm_button, pattern=r"^bingoconf:"))
     app.add_handler(CallbackQueryHandler(bingo_mode_button, pattern=r"^bingomode:"))
     app.add_handler(CallbackQueryHandler(bingo_ocr_confirm_button, pattern=r"^bingoocr:"))

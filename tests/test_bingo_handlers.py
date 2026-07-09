@@ -850,3 +850,20 @@ def test_failed_verification_promotes_next_queued(bingo, store, monkeypatch):
     assert store.submission_status(a) == "failed"
     assert store.submission_status(b) == "confirming"       # next promoted
     bingo_queue._PENDING_READ.pop(b, None)
+
+
+# --- /import_bingo_queue facil command --------------------------------------
+
+def test_import_bingo_queue_command_is_facil_only_and_reports(bingo, store, monkeypatch):
+    from handlers import bingo_queue
+    monkeypatch.setattr(bingo_queue, "import_queue", AsyncMock(return_value=3))
+    # is_facilitator is async in utils.auth; make the caller a facil
+    monkeypatch.setattr("handlers.bingo.is_facilitator", AsyncMock(return_value=True), raising=False)
+    from utils import auth
+    monkeypatch.setattr(auth, "is_facilitator", AsyncMock(return_value=True))
+    ctx = _context()
+    upd = _text_update(100, "aria", "/import_bingo_queue")
+    asyncio.run(bingo.import_bingo_queue(upd, ctx))
+    bingo_queue.import_queue.assert_awaited_once()
+    sent = upd.effective_message.reply_text.await_args.args[0]
+    assert "3" in sent and "queue" in sent.lower()
