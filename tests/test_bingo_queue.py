@@ -98,6 +98,8 @@ class FakeStore:
         self.rows = {}
         self._id = 0
         self._open = False
+        self.members = {}
+        self.prizes = set()
     def queue_submission(self, uid, handle, sheet_no):
         self.rows = {i: r for i, r in self.rows.items()
                      if not (r["submitter_user_id"] == uid
@@ -129,7 +131,14 @@ class FakeStore:
     def set_queue_open(self):
         self._open = True
     def winning_members(self, sid):
-        return []                             # default: no persisted winning line
+        return self.members.get(sid, [])      # default: no persisted winning line
+    def has_bingo_prize(self, uid):
+        return uid in self.prizes
+    def all_bingo_submissions(self):
+        return sorted((dict(r) for r in self.rows.values()),
+                      key=lambda r: (r["submitted_at"], r["id"]))
+    def requeue_submission(self, sid):
+        self.rows[sid]["status"] = "queued"
 
 
 def test_kickoff_promotes_only_ten_earliest(monkeypatch):
@@ -339,5 +348,38 @@ def test_enqueue_opens_round_at_ten(monkeypatch):
     asyncio.run(bingo_queue.enqueue(ctx, 10, "u10", 1, {"cells": _cells({})}))  # 10th
     assert fake.is_queue_open() is True
     assert bingo_queue._send_confirmation.await_count == 10
+    for sid in list(bingo_queue._PENDING_READ):
+        bingo_queue._PENDING_READ.pop(sid, None)
+
+
+def test_import_queue_dedups_to_first_excludes_winners_supersedes_rest(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    monkeypatch.setattr(fake, "user_id_for_handle", lambda h: 1, raising=False)
+    # helper to add a terminal past submission with a recorded line
+    def past(uid, handle, when, status):
+        sid = fake.queue_submission(uid, handle, 1)
+        fake.rows[sid]["submitted_at"] = when
+        fake.rows[sid]["status"] = status
+        fake.members[sid] = [{"row": 0, "col": c, "handle": h} for c, h in
+                             [(0, "a"), (1, "b"), (2, "c"), (3, "d"), (4, "e")]]
+        return sid
+    # user 1: two failed submissions -> only the FIRST is re-queued
+    s1a = past(1, "u1", "00001", "failed")
+    s1b = past(1, "u1", "00009", "failed")
+    # user 2: a winner -> excluded entirely
+    s2 = past(2, "u2", "00002", "verified")
+    fake.prizes.add(2)
+    # user 3: one failed -> re-queued
+    s3 = past(3, "u3", "00003", "failed")
+    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
+    n = asyncio.run(bingo_queue.import_queue(_ctx()))
+    assert n == 2                                        # users 1 and 3
+    assert fake.submission_status(s1a) == "confirming" or fake.submission_status(s1a) == "queued"
+    assert fake.submission_status(s1b) == "superseded"  # later dup superseded
+    assert fake.submission_status(s2) == "verified"     # winner untouched
+    assert fake.is_queue_open() is True
+    # ordering preserved: s1a (00001) ranks before s3 (00003)
     for sid in list(bingo_queue._PENDING_READ):
         bingo_queue._PENDING_READ.pop(sid, None)

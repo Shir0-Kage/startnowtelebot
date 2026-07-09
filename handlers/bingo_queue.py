@@ -284,6 +284,36 @@ async def _start_verification(context, submission_id, line, handle, sheet_no):
     _PENDING_READ.pop(submission_id, None)
 
 
+async def import_queue(context):
+    """Facil: fold every non-winner's FIRST past submission into the queue,
+    supersede their other submissions, open the round, and start checking. Returns
+    how many players were imported. Idempotent (skips players already in-flight)."""
+    by_user = {}
+    for s in storage.all_bingo_submissions():        # time-ordered (submitted_at, id)
+        by_user.setdefault(s["submitter_user_id"], []).append(s)
+    imported = 0
+    for uid, subs in by_user.items():
+        if storage.has_bingo_prize(uid):
+            continue                                 # winner: keep their prize
+        first = subs[0]
+        if first["status"] in ("queued", "confirming"):
+            continue                                 # already imported / in-flight
+        storage.requeue_submission(first["id"])
+        read = _read_from_members(first["id"])
+        if read is not None:
+            _PENDING_READ[first["id"]] = {
+                "read": read,
+                "handle": first.get("submitter_handle") or "",
+                "sheet_no": first["sheet_no"],
+            }
+        for other in subs[1:]:
+            storage.set_submission_status(other["id"], "superseded")
+        imported += 1
+    storage.set_queue_open()
+    await maybe_kickoff(context)
+    return imported
+
+
 # ---------------------------------------------------------------------------
 # Startup + registration
 # ---------------------------------------------------------------------------
