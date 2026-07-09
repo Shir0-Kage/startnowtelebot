@@ -860,3 +860,83 @@ def submission_status(submission_id):
             "SELECT status FROM bingo_submissions WHERE id = ?", (submission_id,)
         ).fetchone()
     return row["status"] if row else None
+
+
+# --- Forward round: phase flags + forward-submission helpers ---------------
+
+def set_forward_phase(phase):
+    """Record the forward round phase ('collecting'|'verifying'|'released')."""
+    with _lock:
+        _conn.execute(
+            "INSERT OR IGNORE INTO bingo_flags (name, set_at) VALUES (?, ?)",
+            (f"forward_{phase}", _now_iso()),
+        )
+        _conn.commit()
+
+
+def forward_phase():
+    with _lock:
+        rows = {r["name"] for r in _conn.execute(
+            "SELECT name FROM bingo_flags WHERE name LIKE 'forward_%'")}
+    for phase in ("released", "verifying", "collecting"):
+        if f"forward_{phase}" in rows:
+            return phase
+    return None
+
+
+def forward_started_at():
+    with _lock:
+        row = _conn.execute(
+            "SELECT set_at FROM bingo_flags WHERE name = 'forward_collecting'").fetchone()
+    return row["set_at"] if row else None
+
+
+def forward_batch_active():
+    return forward_phase() in ("collecting", "verifying")
+
+
+def queue_forwarded_submission(user_id, handle, sheet_no, submitted_at):
+    with _lock:
+        _conn.execute(
+            "DELETE FROM bingo_submissions WHERE submitter_user_id = ? "
+            "AND status IN ('fwd_confirming','ready')", (user_id,))
+        cur = _conn.execute(
+            "INSERT INTO bingo_submissions "
+            "(submitter_user_id, submitter_handle, sheet_no, corner_read, "
+            " status, submitted_at, verified_at) "
+            "VALUES (?, ?, ?, NULL, 'fwd_confirming', ?, NULL)",
+            (user_id, (handle or "").lower(), sheet_no, submitted_at))
+        _conn.commit()
+        return cur.lastrowid
+
+
+def set_forward_ready(submission_id):
+    with _lock:
+        _conn.execute(
+            "UPDATE bingo_submissions SET status = 'ready' WHERE id = ?",
+            (submission_id,))
+        _conn.commit()
+
+
+def ready_in_order():
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM bingo_submissions WHERE status = 'ready' "
+            "ORDER BY submitted_at, id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def forward_entry_count():
+    with _lock:
+        row = _conn.execute(
+            "SELECT COUNT(*) AS c FROM bingo_submissions "
+            "WHERE status IN ('fwd_confirming','ready')").fetchone()
+    return row["c"]
+
+
+def active_forward_verifying_count():
+    with _lock:
+        row = _conn.execute(
+            "SELECT COUNT(*) AS c FROM bingo_submissions "
+            "WHERE status IN ('pending','verified')").fetchone()
+    return row["c"]

@@ -320,3 +320,41 @@ def test_admin_notified_lifecycle(store):
 def test_bingo_prizes_has_admin_notified_column(store):
     cols = [r[1] for r in store._conn.execute("PRAGMA table_info(bingo_prizes)")]
     assert "admin_notified_at" in cols
+
+
+# --- forward round: phase flags + forward-submission helpers ---------------
+
+def test_forward_phase_progression(store):
+    assert store.forward_phase() is None
+    store.set_forward_phase("collecting")
+    assert store.forward_phase() == "collecting"
+    assert store.forward_batch_active() is True
+    assert store.forward_started_at() is not None
+    store.set_forward_phase("verifying")
+    assert store.forward_phase() == "verifying"
+    assert store.forward_batch_active() is True
+    store.set_forward_phase("released")
+    assert store.forward_phase() == "released"
+    assert store.forward_batch_active() is False
+
+
+def test_queue_forwarded_submission_uses_given_time_and_dedups(store):
+    a = store.queue_forwarded_submission(1, "alice", 3, "2026-01-01T09:00:00")
+    a2 = store.queue_forwarded_submission(1, "alice", 3, "2026-01-01T10:00:00")
+    rows = store.ready_in_order()
+    assert rows == []                                  # none ready yet
+    assert store.submission_status(a) is None          # replaced
+    assert store.submission_by_id(a2)["submitted_at"] == "2026-01-01T10:00:00"
+    assert store.forward_entry_count() == 1
+
+
+def test_ready_ordering_and_isolation_from_live_queue(store):
+    b = store.queue_forwarded_submission(2, "bob", 1, "2026-01-01T08:00:00")
+    a = store.queue_forwarded_submission(1, "alice", 1, "2026-01-01T07:00:00")
+    store.set_forward_ready(a); store.set_forward_ready(b)
+    assert [r["submitter_user_id"] for r in store.ready_in_order()] == [1, 2]  # earliest first
+    # forward rows never leak into the live-queue views:
+    assert store.queued_in_order() == []
+    assert store.confirming_submissions() == []
+    assert store.active_slot_count() == 0
+    assert store.forward_entry_count() == 2

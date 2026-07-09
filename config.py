@@ -94,3 +94,8 @@ BINGO_MATCH_MARGIN = 8
 
 # Breather after a failed attempt before the same person may /submit_bingo again.
 BINGO_RETRY_COOLDOWN = timedelta(seconds=60)
+
+# Forward round: target number of forwarded sheets to collect, and the window
+# they're collected over before the batch closes for verification.
+FORWARD_ROUND_TARGET = 20
+FORWARD_ROUND_WINDOW = timedelta(days=2)
