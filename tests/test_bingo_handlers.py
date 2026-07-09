@@ -770,6 +770,28 @@ def test_confirm_button_caches_answer_game_wide(bingo, store):
     assert store.get_cached_confirmation(1, "likes cats") == "yes"
 
 
+# --- forward round: batch results hold announcements -----------------------
+
+def test_award_during_forward_batch_holds_announcements(bingo, store, monkeypatch):
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    monkeypatch.setattr(bingo_forward, "maybe_release", AsyncMock())
+    store.set_forward_phase("verifying")
+
+    store.allocate_bingo_sheet(100, "alice")
+    sub_id = store.start_bingo_submission(100, "alice", store.get_bingo_sheet(100), 1)
+    store.record_winning_members(sub_id, [
+        {"row": 0, "col": 0, "handle": "bob", "prompt": "p0", "target_user_id": 1},
+    ])
+    ctx = _context()
+    asyncio.run(bingo._award(ctx, sub_id))
+
+    assert store.has_bingo_prize(100) is True
+    assert store.bingo_prizes_claimed() == 1
+    ctx.bot.send_message.assert_not_awaited()
+    bingo_forward.maybe_release.assert_awaited_once()
+
+
 # --- closing the game cancels outstanding timeout jobs ---------------------
 
 def test_award_at_limit_cancels_outstanding_timeouts(bingo, store, monkeypatch):

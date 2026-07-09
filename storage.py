@@ -792,6 +792,14 @@ def mark_admin_notified(winner_user_id):
         _conn.commit()
 
 
+def all_bingo_prizes():
+    """Every claimed prize, earliest claim first."""
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM bingo_prizes ORDER BY claim_no").fetchall()
+    return [dict(r) for r in rows]
+
+
 def pending_submissions():
     """All still-pending submissions (for re-arming 12h timeout jobs on
     startup), ordered by submission time."""

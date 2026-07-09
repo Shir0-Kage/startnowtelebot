@@ -297,3 +297,42 @@ async def _forward_timeout_job(context):
     """2-day forward-round deadline: close collecting even if under target."""
     if storage.forward_phase() == "collecting":
         await close_collection(context)
+
+
+# ---------------------------------------------------------------------------
+# Batch results: hold every winner announcement until the round settles, then
+# release them all together (channel-free — DMs to winners + one admin
+# summary), instead of _award's normal one-at-a-time announcements.
+# ---------------------------------------------------------------------------
+
+async def maybe_release(context):
+    """Release batched results when the 10 winners are settled, or when the round
+    has fully resolved with fewer."""
+    if storage.forward_phase() != "verifying":
+        return
+    done = (storage.bingo_prizes_claimed() >= config.BINGO_PRIZE_LIMIT
+            or (not storage.ready_in_order() and not storage.pending_submissions()))
+    if done:
+        await _release_results(context)
+
+
+async def _release_results(context):
+    from handlers import bingo
+    storage.set_forward_phase("released")
+    winners = storage.all_bingo_prizes()
+    for w in winners:
+        try:
+            await context.bot.send_message(
+                chat_id=w["winner_user_id"],
+                text=f"🏆 BINGO! You're one of the {len(winners)} winners — "
+                     "congratulations! 🎉 A facil will be in touch to sort out your prize.")
+        except Exception:
+            pass
+        storage.mark_admin_notified(w["winner_user_id"])   # WN sweep won't double-announce
+    handles = ", ".join(f"@{w['handle']}" for w in winners) or "(none)"
+    summary = (f"🏁 Bingo prize round complete — {len(winners)} winner(s): {handles}")
+    for uid in bingo._admin_recipient_ids():
+        try:
+            await context.bot.send_message(chat_id=uid, text=summary)
+        except Exception:
+            pass
