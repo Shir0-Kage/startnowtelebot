@@ -326,3 +326,51 @@ def test_begin_round_dms_all_allocations_sets_phase_returns_count(store, monkeyp
     # the 2-day deadline job is armed exactly once
     ctx.job_queue.run_once.assert_called_once()
     assert ctx.job_queue.run_once.call_args.kwargs["name"] == "bingo:forward_deadline"
+
+
+def test_begin_round_noop_when_round_already_in_progress(store, monkeypatch):
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    store.set_forward_phase("verifying")            # a round is already live
+    ctx = MagicMock(); ctx.bot = AsyncMock(); ctx.job_queue = MagicMock()
+    n = asyncio.run(bingo_forward.begin_round(ctx))
+    assert n == -1                                  # sentinel
+    ctx.bot.send_message.assert_not_awaited()       # nothing re-broadcast
+    ctx.job_queue.run_once.assert_not_called()      # deadline not re-armed
+
+
+# --- stuck-in-verifying regression: close with 0 ready, then a late confirm ---
+
+def test_late_confirm_during_verifying_promotes_to_pending(store, monkeypatch):
+    import config
+    from handlers import bingo, bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    monkeypatch.setattr(store, "user_id_for_handle", lambda h: 1, raising=False)
+    monkeypatch.setattr(bingo, "_dm_subjects", AsyncMock())
+    monkeypatch.setattr(bingo, "_finalize", AsyncMock())
+    # Collection closes with ZERO 'ready' — only a 'fwd_confirming' entry (the
+    # person forwarded but hasn't tapped Confirm yet).
+    store.set_forward_phase("collecting")
+    sid = store.queue_forwarded_submission(100, "submitter", 1, "2026-01-01T09:00:00")
+    asyncio.run(bingo_forward.close_collection(_ctx()))
+    assert store.forward_phase() == "verifying"       # closed...
+    assert store.submission_status(sid) == "fwd_confirming"  # ...nothing promoted
+    # A confirm that lands AFTER the close must still drive the round forward.
+    bingo_forward._PENDING_READ[sid] = {
+        "read": {"cells": _cells(_TOP_ROW)}, "handle": "submitter", "sheet_no": 1}
+    q = AsyncMock(); q.data = f"bingofwd:confirm:{sid}"; q.from_user = MagicMock(id=100)
+    upd = MagicMock(); upd.callback_query = q
+    ctx = _ctx(); ctx.job_queue = MagicMock()
+    asyncio.run(bingo_forward.confirm_button(upd, ctx))
+    assert store.submission_status(sid) == "pending"  # promoted into verification
+    bingo._dm_subjects.assert_awaited_once()
+
+
+def test_forward_timeout_job_releases_when_nothing_ready_or_pending(store, monkeypatch):
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    # Already 'verifying' with nothing ready and nothing pending: the deadline
+    # backstop must settle the round instead of leaving it stuck forever.
+    store.set_forward_phase("verifying")
+    asyncio.run(bingo_forward._forward_timeout_job(_ctx()))
+    assert store.forward_phase() == "released"

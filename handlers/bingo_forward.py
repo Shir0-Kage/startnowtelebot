@@ -159,7 +159,6 @@ async def _mark_ready(context, submission_id, line, sheet_no):
     winning members and flip the entry to 'ready', then DM the submitter.
     Unlike bingo_queue._start_verification, there's no per-tagged-person
     verification here -- results are released together once the batch closes."""
-    from handlers import bingo               # lazy: avoid import cycle
     from data import bingo_templates as templates
     members = [{
         "row": r, "col": c, "handle": h,
@@ -177,6 +176,12 @@ async def _mark_ready(context, submission_id, line, sheet_no):
             )
         except Exception:
             pass
+    # A confirm that lands AFTER collection has closed still has to drive the
+    # round: promote this fresh 'ready' into verification and check for release.
+    # During 'collecting' the phase guard skips this (kickoff happens at close).
+    if storage.forward_phase() == "verifying":
+        await kickoff_verification(context)
+        await maybe_release(context)
     _PENDING_READ.pop(submission_id, None)
 
 
@@ -273,13 +278,8 @@ async def _start_verification(context, sub):
     sid = sub["id"]
     members = storage.winning_members(sid)
     storage.set_submission_status(sid, "pending")
-    try:
-        await context.bot.send_message(
-            chat_id=sub["submitter_user_id"],
-            text="You're in — results will be released together soon. 🎊",
-        )
-    except Exception:
-        pass
+    # (No submitter DM here: _mark_ready already acknowledged them at 'ready';
+    # a second near-identical "you're in" DM at 'pending' would just repeat it.)
     if getattr(context, "job_queue", None) is not None:
         context.job_queue.run_once(
             bingo._confirmation_timeout,
@@ -295,9 +295,13 @@ async def _start_verification(context, sub):
 
 
 async def _forward_timeout_job(context):
-    """2-day forward-round deadline: close collecting even if under target."""
-    if storage.forward_phase() == "collecting":
-        await close_collection(context)
+    """2-day forward-round deadline: close collecting even if under target, then
+    do a terminal release check. maybe_release HERE (at the deadline) fires the
+    0-ready / all-resolved case that would otherwise leave the round stuck in
+    'verifying' forever -- unlike inside close_collection, which must stay
+    release-free so the 20-forward close doesn't release with 0 winners."""
+    await close_collection(context)      # sets verifying + kickoff (no-op re-kick)
+    await maybe_release(context)         # deadline release: 0-ready / all-resolved
 
 
 # ---------------------------------------------------------------------------
@@ -321,11 +325,13 @@ async def _release_results(context):
     from handlers import bingo
     storage.set_forward_phase("released")
     winners = storage.all_bingo_prizes()
+    rank = ("a winner" if len(winners) == 1
+            else f"one of the {len(winners)} winners")
     for w in winners:
         try:
             await context.bot.send_message(
                 chat_id=w["winner_user_id"],
-                text=f"🏆 BINGO! You're one of the {len(winners)} winners — "
+                text=f"🏆 BINGO! You're {rank} — "
                      "congratulations! 🎉 A facil will be in touch to sort out your prize.")
         except Exception:
             pass
@@ -353,7 +359,10 @@ async def _release_results(context):
 
 async def begin_round(context):
     """Start the forward round: set phase collecting, DM every card-holder to
-    forward their earliest card, and arm the 2-day deadline. Returns the count DM'd."""
+    forward their earliest card, and arm the 2-day deadline. Returns the count
+    DM'd, or -1 (a sentinel, sending nothing) if a round is already in progress."""
+    if storage.forward_phase() is not None:
+        return -1                            # already collecting/verifying/released
     storage.set_forward_phase("collecting")
     n = 0
     for a in storage.all_bingo_allocations():
@@ -376,10 +385,26 @@ def register(app):
     app.add_handler(CallbackQueryHandler(confirm_button, pattern=r"^bingofwd:confirm:"))
 
 
+async def _forward_resume_job(context):
+    """Restart resume: a round that was mid-'verifying' when the bot went down
+    has no live timer driving it, so re-run the kickoff + release check once so
+    it can promote any 'ready' left over and settle instead of hanging."""
+    await kickoff_verification(context)
+    await maybe_release(context)
+
+
 def rearm(app):
-    """Re-arm the 2-day deadline if a collecting round was in progress at restart."""
+    """Re-arm the 2-day deadline if a collecting round was in progress at
+    restart; if a round was mid-'verifying', schedule a one-shot resume instead
+    so it doesn't stay stuck without a live timer to advance it."""
     jq = app.job_queue
-    if jq is None or storage.forward_phase() != "collecting":
+    if jq is None:
+        return
+    phase = storage.forward_phase()
+    if phase == "verifying":
+        jq.run_once(_forward_resume_job, when=3, name="bingo:forward_resume")
+        return
+    if phase != "collecting":
         return
     started = storage.forward_started_at()
     from zoneinfo import ZoneInfo

@@ -881,6 +881,10 @@ async def import_bingo_queue(update, context):
 @facil_only
 async def start_forward_round(update, context):
     n = await bingo_forward.begin_round(context)
+    if n == -1:
+        await update.effective_message.reply_text(
+            "A forward round is already in progress.")
+        return
     await update.effective_message.reply_text(
         f"Forward round started — messaged {n} card-holder(s) to forward their cards. 📸")
 
