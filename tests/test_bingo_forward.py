@@ -247,6 +247,26 @@ def test_release_results_dms_all_winners_and_admin_summary(store, monkeypatch):
     assert store.winners_pending_admin_notice() == []   # all marked notified
 
 
+def test_release_results_no_admin_reachable_leaves_winners_unmarked(store, monkeypatch):
+    from handlers import bingo, bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    monkeypatch.setattr(bingo, "_admin_recipient_ids", lambda: set())
+    store.set_forward_phase("verifying")
+    store.claim_bingo_prize(1, "alice", 101)
+    store.claim_bingo_prize(2, "bob", 102)
+    ctx = _ctx()
+    asyncio.run(bingo_forward._release_results(ctx))
+
+    assert store.forward_phase() == "released"
+    dm_calls = {c.kwargs["chat_id"]: c.kwargs["text"]
+                for c in ctx.bot.send_message.await_args_list}
+    assert "winners" in dm_calls[1].lower()
+    assert "winners" in dm_calls[2].lower()
+    assert len(dm_calls) == 2   # no summary DM sent to anyone
+    pending = {w["winner_user_id"] for w in store.winners_pending_admin_notice()}
+    assert pending == {1, 2}   # both left unmarked for the WN sweep to retry
+
+
 def test_maybe_release_fires_at_prize_limit(store, monkeypatch):
     import config
     from handlers import bingo_forward

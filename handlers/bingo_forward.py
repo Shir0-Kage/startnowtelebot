@@ -328,11 +328,19 @@ async def _release_results(context):
                      "congratulations! 🎉 A facil will be in touch to sort out your prize.")
         except Exception:
             pass
-        storage.mark_admin_notified(w["winner_user_id"])   # WN sweep won't double-announce
+    recipients = bingo._admin_recipient_ids()
+    if not recipients:
+        # No admin reachable: send no summary and leave every winner unmarked
+        # so winners_pending_admin_notice() still lists them and the existing
+        # winner-notify startup sweep announces them once an admin is reachable
+        # (mirrors bingo._dm_admins_of_winner).
+        return
     handles = ", ".join(f"@{w['handle']}" for w in winners) or "(none)"
     summary = (f"🏁 Bingo prize round complete — {len(winners)} winner(s): {handles}")
-    for uid in bingo._admin_recipient_ids():
+    for uid in recipients:
         try:
             await context.bot.send_message(chat_id=uid, text=summary)
         except Exception:
             pass
+    for w in winners:
+        storage.mark_admin_notified(w["winner_user_id"])   # WN sweep won't double-announce
