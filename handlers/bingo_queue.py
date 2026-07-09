@@ -296,8 +296,8 @@ async def import_queue(context):
         if storage.has_bingo_prize(uid):
             continue                                 # winner: keep their prize
         first = subs[0]
-        if first["status"] in ("queued", "confirming"):
-            continue                                 # already imported / in-flight
+        if first["status"] in ("queued", "confirming", "pending", "verified"):
+            continue                                 # already imported / in-flight / won
         storage.requeue_submission(first["id"])
         read = _read_from_members(first["id"])
         if read is not None:

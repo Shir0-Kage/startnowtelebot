@@ -381,5 +381,35 @@ def test_import_queue_dedups_to_first_excludes_winners_supersedes_rest(monkeypat
     assert fake.submission_status(s2) == "verified"     # winner untouched
     assert fake.is_queue_open() is True
     # ordering preserved: s1a (00001) ranks before s3 (00003)
+    promoted_users = [c.args[1]["submitter_user_id"]
+                      for c in bingo_queue._send_confirmation.await_args_list]
+    assert promoted_users == [1, 3]   # user 1 (00001) confirmed before user 3 (00003)
+    for sid in list(bingo_queue._PENDING_READ):
+        bingo_queue._PENDING_READ.pop(sid, None)
+
+
+def test_import_queue_excludes_winner_with_multiple_submissions(monkeypatch):
+    fake = FakeStore()
+    monkeypatch.setattr(bingo_queue, "storage", fake)
+    monkeypatch.setattr(fake, "user_id_for_handle", lambda h: 1, raising=False)
+    # helper to add a terminal past submission with a recorded line
+    def past(uid, handle, when, status):
+        sid = fake.queue_submission(uid, handle, 1)
+        fake.rows[sid]["submitted_at"] = when
+        fake.rows[sid]["status"] = status
+        fake.members[sid] = [{"row": 0, "col": c, "handle": h} for c, h in
+                             [(0, "a"), (1, "b"), (2, "c"), (3, "d"), (4, "e")]]
+        return sid
+    # a winner with TWO past submissions -> excluded entirely, neither row touched
+    s1 = past(1, "u1", "00001", "failed")
+    s2 = past(1, "u1", "00002", "verified")
+    fake.prizes.add(1)
+    monkeypatch.setattr(bingo_queue, "_send_confirmation", AsyncMock())
+    monkeypatch.setattr(bingo_queue, "_arm_confirm_timeout", MagicMock())
+    n = asyncio.run(bingo_queue.import_queue(_ctx()))
+    assert n == 0                                        # winner contributes nothing
+    assert fake.submission_status(s1) == "failed"        # untouched, not re-queued
+    assert fake.submission_status(s2) == "verified"      # untouched, not superseded
+    assert bingo_queue._send_confirmation.await_count == 0
     for sid in list(bingo_queue._PENDING_READ):
         bingo_queue._PENDING_READ.pop(sid, None)
