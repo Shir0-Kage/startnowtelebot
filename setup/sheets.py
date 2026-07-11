@@ -14,7 +14,7 @@ import urllib.request
 
 # Year 1 groupings (detailed sheet). Two tabs, same layout: AM and PM.
 YEAR1_SHEET_ID = "17WxHixZ41a0m7LkdHPSrLzqyeyuh09fbI5Z8CG5YyXw"
-YEAR1_TABS = ["46132107", "1604732138"]  # AM1-10, PM1-10
+YEAR1_TABS = ["976038792", "163942444"]  # AM1-10, PM1-10 (gids refreshed 2026-07 after the tabs were recreated; the old 46132107/1604732138 now 400)
 
 # Facil group assignments — the tab with the AM1..PM10 "Groups" column.
 FACIL_GROUP_SHEET_ID = "15UHyd0jaK5JnU1YRH1lfDN7CBUMzK1R_C-Jq9p-Pjik"
