@@ -112,6 +112,27 @@ def test_confirm_button_marks_ready_when_fully_recognised(store, monkeypatch):
     assert "released together" in kwargs["text"].lower()
 
 
+def test_confirm_button_marks_ready_even_when_handle_unreachable(store, monkeypatch):
+    """Reachability no longer matters: a complete roster-matched line is a
+    win even when one of its handles has never /started the bot."""
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    unreachable = {"dan"}
+    monkeypatch.setattr(store, "user_id_for_handle",
+                         lambda h: None if h in unreachable else 1, raising=False)
+    sid = store.queue_forwarded_submission(105, "submitter", 1, "2026-01-01T09:00:00")
+    bingo_forward._PENDING_READ[sid] = {
+        "read": {"cells": _cells(_TOP_ROW)}, "handle": "submitter", "sheet_no": 1}
+    q = AsyncMock(); q.data = f"bingofwd:confirm:{sid}"; q.from_user = MagicMock(id=105)
+    upd = MagicMock(); upd.callback_query = q
+    ctx = _ctx()
+    asyncio.run(bingo_forward.confirm_button(upd, ctx))
+    assert store.submission_status(sid) == "ready"
+    members = store.winning_members(sid)
+    assert len(members) == 5
+    assert {m["handle"] for m in members} == set(_TOP_ROW.values())
+
+
 def test_confirm_button_incomplete_read_stays_confirming(store, monkeypatch):
     from handlers import bingo_forward
     monkeypatch.setattr(bingo_forward, "storage", store)
@@ -146,6 +167,22 @@ def test_on_resend_routes_fwd_confirming_user_to_ready(store, monkeypatch):
     sid = store.queue_forwarded_submission(103, "submitter", 1, "2026-01-01T09:00:00")
     handled = asyncio.run(bingo_forward.on_resend(
         _ctx(), 103, {"cells": _cells(_TOP_ROW)}))
+    assert handled is True
+    assert store.submission_status(sid) == "ready"
+    assert len(store.winning_members(sid)) == 5
+
+
+def test_on_resend_routes_to_ready_even_when_handle_unreachable(store, monkeypatch):
+    """Same line-exists rule applies on resend: an unreachable handle in an
+    otherwise complete line still marks the entry ready."""
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    unreachable = {"eve"}
+    monkeypatch.setattr(store, "user_id_for_handle",
+                         lambda h: None if h in unreachable else 1, raising=False)
+    sid = store.queue_forwarded_submission(106, "submitter", 1, "2026-01-01T09:00:00")
+    handled = asyncio.run(bingo_forward.on_resend(
+        _ctx(), 106, {"cells": _cells(_TOP_ROW)}))
     assert handled is True
     assert store.submission_status(sid) == "ready"
     assert len(store.winning_members(sid)) == 5
