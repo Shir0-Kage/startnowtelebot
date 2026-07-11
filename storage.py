@@ -156,6 +156,21 @@ CREATE TABLE IF NOT EXISTS bingo_flags (
     name    TEXT PRIMARY KEY,
     set_at  TEXT
 );
+
+-- ===================================================================
+-- Anonymous whistleblowing
+-- ===================================================================
+
+-- Single-row: the learned channel/group link plus the active base-post
+-- anchor. Never stores any whistleblower identity.
+CREATE TABLE IF NOT EXISTS whistle (
+    id                     INTEGER PRIMARY KEY CHECK (id = 1),
+    channel_id             INTEGER,
+    group_id               INTEGER,
+    anchor_msg_id          INTEGER,
+    pending_channel_msg_id INTEGER,
+    updated_at             TEXT
+);
 """
 
 
@@ -965,3 +980,61 @@ def active_forward_verifying_count():
             "SELECT COUNT(*) AS c FROM bingo_submissions "
             "WHERE status IN ('pending','verified')").fetchone()
     return row["c"]
+
+
+# ---------------------------------------------------------------------------
+# Anonymous whistleblowing
+# ---------------------------------------------------------------------------
+
+def _whistle_row():
+    with _lock:
+        row = _conn.execute("SELECT * FROM whistle WHERE id = 1").fetchone()
+    return dict(row) if row else None
+
+
+def set_whistle_link(channel_id, group_id):
+    with _lock:
+        _conn.execute(
+            "INSERT INTO whistle (id, channel_id, group_id, updated_at) "
+            "VALUES (1, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET channel_id=excluded.channel_id, "
+            "group_id=excluded.group_id, updated_at=excluded.updated_at",
+            (channel_id, group_id, _now_iso()))
+        _conn.commit()
+
+
+def get_whistle_link():
+    row = _whistle_row()
+    return (row["channel_id"], row["group_id"]) if row else (None, None)
+
+
+def set_whistle_pending(channel_msg_id):
+    with _lock:
+        _conn.execute(
+            "INSERT INTO whistle (id, pending_channel_msg_id, updated_at) "
+            "VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "pending_channel_msg_id=excluded.pending_channel_msg_id, "
+            "updated_at=excluded.updated_at",
+            (channel_msg_id, _now_iso()))
+        _conn.commit()
+
+
+def resolve_whistle_anchor(channel_msg_id, anchor_msg_id):
+    with _lock:
+        row = _conn.execute(
+            "SELECT pending_channel_msg_id FROM whistle WHERE id = 1").fetchone()
+        if not row or row["pending_channel_msg_id"] != channel_msg_id:
+            return False
+        _conn.execute(
+            "UPDATE whistle SET anchor_msg_id = ?, pending_channel_msg_id = NULL, "
+            "updated_at = ? WHERE id = 1", (anchor_msg_id, _now_iso()))
+        _conn.commit()
+        return True
+
+
+def get_whistle_anchor():
+    row = _whistle_row()
+    if not row or row.get("anchor_msg_id") is None:
+        return (None, None)
+    return (row["group_id"], row["anchor_msg_id"])

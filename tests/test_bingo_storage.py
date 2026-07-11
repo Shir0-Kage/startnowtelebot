@@ -358,3 +358,16 @@ def test_ready_ordering_and_isolation_from_live_queue(store):
     assert store.confirming_submissions() == []
     assert store.active_slot_count() == 0
     assert store.forward_entry_count() == 2
+
+
+def test_whistle_link_and_anchor_lifecycle(store):
+    assert store.get_whistle_link() == (None, None)
+    assert store.get_whistle_anchor() == (None, None)
+    store.set_whistle_link(-100123, -100456)          # channel, group
+    assert store.get_whistle_link() == (-100123, -100456)
+    store.set_whistle_pending(77)                      # base post's channel msg id
+    assert store.resolve_whistle_anchor(88, 999) is False   # wrong channel id -> no match
+    assert store.get_whistle_anchor() == (None, None)
+    assert store.resolve_whistle_anchor(77, 500) is True    # matches pending -> sets anchor
+    assert store.get_whistle_anchor() == (-100456, 500)     # (group_id, anchor msg id)
+    assert store.resolve_whistle_anchor(77, 501) is False    # pending cleared -> no re-resolve
