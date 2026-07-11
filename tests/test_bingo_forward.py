@@ -209,40 +209,40 @@ def test_on_resend_returns_false_for_unrelated_user(store, monkeypatch):
     assert handled is False
 
 
-# --- collection close + verification kickoff -------------------------------
+# --- collection close + direct winner selection ----------------------------
 
 def test_maybe_close_collection_closes_at_target(store, monkeypatch):
     import config
     from handlers import bingo_forward
     monkeypatch.setattr(bingo_forward, "storage", store)
-    monkeypatch.setattr(bingo_forward, "kickoff_verification", AsyncMock())
     store.set_forward_phase("collecting")
-    for uid in range(1, config.FORWARD_ROUND_TARGET + 1):
-        store.queue_forwarded_submission(uid, f"u{uid}", 1, "2026-01-01T09:00:00")
+    # TARGET 'ready' entries -> closing claims the earliest 10 directly.
+    for i in range(config.FORWARD_ROUND_TARGET):
+        sid = store.queue_forwarded_submission(
+            100 + i, f"u{i}", 1, f"2026-01-01T09:00:{i:02d}")
+        store.set_forward_ready(sid)
     asyncio.run(bingo_forward.maybe_close_collection(_ctx()))
-    assert store.forward_phase() == "verifying"
-    bingo_forward.kickoff_verification.assert_awaited_once()
+    assert store.forward_phase() == "released"
+    assert store.bingo_prizes_claimed() == config.BINGO_PRIZE_LIMIT
 
 
 def test_maybe_close_collection_noop_below_target(store, monkeypatch):
     import config
     from handlers import bingo_forward
     monkeypatch.setattr(bingo_forward, "storage", store)
-    monkeypatch.setattr(bingo_forward, "kickoff_verification", AsyncMock())
+    monkeypatch.setattr(bingo_forward, "_release_results", AsyncMock())
     store.set_forward_phase("collecting")
     for uid in range(1, config.FORWARD_ROUND_TARGET):        # one short
         store.queue_forwarded_submission(uid, f"u{uid}", 1, "2026-01-01T09:00:00")
     asyncio.run(bingo_forward.maybe_close_collection(_ctx()))
     assert store.forward_phase() == "collecting"
-    bingo_forward.kickoff_verification.assert_not_awaited()
+    bingo_forward._release_results.assert_not_awaited()
 
 
-def test_kickoff_verification_promotes_ten_earliest_of_twelve(store, monkeypatch):
+def test_select_winners_claims_ten_earliest_of_twelve(store, monkeypatch):
     import config
-    from handlers import bingo, bingo_forward
+    from handlers import bingo_forward
     monkeypatch.setattr(bingo_forward, "storage", store)
-    monkeypatch.setattr(bingo, "_dm_subjects", AsyncMock())
-    monkeypatch.setattr(bingo, "_finalize", AsyncMock())
     store.set_forward_phase("verifying")
     sids = []
     for i in range(12):
@@ -250,15 +250,43 @@ def test_kickoff_verification_promotes_ten_earliest_of_twelve(store, monkeypatch
             200 + i, f"u{i}", 1, f"2026-01-01T09:00:{i:02d}")
         store.set_forward_ready(sid)
         sids.append(sid)
-    ctx = _ctx()
-    ctx.job_queue = MagicMock()
-    asyncio.run(bingo_forward.kickoff_verification(ctx))
-    promoted = [sid for sid in sids if store.submission_status(sid) == "pending"]
+    asyncio.run(bingo_forward.select_winners(_ctx()))
+    claimed = [sid for sid in sids if store.submission_status(sid) == "verified"]
     still_ready = [sid for sid in sids if store.submission_status(sid) == "ready"]
-    assert promoted == sids[:config.BINGO_PRIZE_LIMIT]
+    # earliest-first order, capped at the 10-prize limit
+    assert claimed == sids[:config.BINGO_PRIZE_LIMIT]
     assert still_ready == sids[config.BINGO_PRIZE_LIMIT:]
-    assert bingo._dm_subjects.await_count == config.BINGO_PRIZE_LIMIT
-    assert bingo._finalize.await_count == config.BINGO_PRIZE_LIMIT
+    assert store.bingo_prizes_claimed() == config.BINGO_PRIZE_LIMIT
+
+
+def test_close_collection_claims_winners_and_dms(store, monkeypatch):
+    from handlers import bingo, bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    monkeypatch.setattr(bingo, "_admin_recipient_ids", lambda: set())
+    store.set_forward_phase("verifying")
+    for i, uid in enumerate([301, 302, 303]):
+        sid = store.queue_forwarded_submission(
+            uid, f"w{i}", 1, f"2026-01-01T09:00:{i:02d}")
+        store.set_forward_ready(sid)
+    ctx = _ctx()
+    asyncio.run(bingo_forward.close_collection(ctx))
+    assert store.forward_phase() == "released"
+    assert store.bingo_prizes_claimed() == 3
+    winners = {w["winner_user_id"] for w in store.all_bingo_prizes()}
+    assert winners == {301, 302, 303}
+    dmd = {c.kwargs["chat_id"] for c in ctx.bot.send_message.await_args_list}
+    assert {301, 302, 303} <= dmd     # each winner DM'd
+
+
+def test_close_collection_idempotent_once_released(store, monkeypatch):
+    from handlers import bingo_forward
+    monkeypatch.setattr(bingo_forward, "storage", store)
+    monkeypatch.setattr(bingo_forward, "select_winners", AsyncMock())
+    monkeypatch.setattr(bingo_forward, "_release_results", AsyncMock())
+    store.set_forward_phase("released")
+    asyncio.run(bingo_forward.close_collection(_ctx()))
+    bingo_forward.select_winners.assert_not_awaited()
+    bingo_forward._release_results.assert_not_awaited()
 
 
 # --- batch results: hold announcements, release together ------------------
@@ -304,47 +332,17 @@ def test_release_results_no_admin_reachable_leaves_winners_unmarked(store, monke
     assert pending == {1, 2}   # both left unmarked for the WN sweep to retry
 
 
-def test_maybe_release_fires_at_prize_limit(store, monkeypatch):
-    import config
-    from handlers import bingo_forward
+def test_release_results_with_no_winners_sets_released(store, monkeypatch):
+    """An empty/late round: _release_results may be called with 0 winners; it
+    just DMs nobody and marks the round released."""
+    from handlers import bingo, bingo_forward
     monkeypatch.setattr(bingo_forward, "storage", store)
-    monkeypatch.setattr(bingo_forward, "_release_results", AsyncMock())
+    monkeypatch.setattr(bingo, "_admin_recipient_ids", lambda: set())
     store.set_forward_phase("verifying")
-    for i in range(config.BINGO_PRIZE_LIMIT):
-        store.claim_bingo_prize(300 + i, f"w{i}", 400 + i)
-    asyncio.run(bingo_forward.maybe_release(_ctx()))
-    bingo_forward._release_results.assert_awaited_once()
-
-
-def test_maybe_release_fires_when_nothing_left_in_flight(store, monkeypatch):
-    from handlers import bingo_forward
-    monkeypatch.setattr(bingo_forward, "storage", store)
-    monkeypatch.setattr(bingo_forward, "_release_results", AsyncMock())
-    store.set_forward_phase("verifying")
-    store.claim_bingo_prize(1, "alice", 101)   # well under the limit
-    asyncio.run(bingo_forward.maybe_release(_ctx()))
-    bingo_forward._release_results.assert_awaited_once()
-
-
-def test_maybe_release_noop_mid_round(store, monkeypatch):
-    from handlers import bingo_forward
-    monkeypatch.setattr(bingo_forward, "storage", store)
-    monkeypatch.setattr(bingo_forward, "_release_results", AsyncMock())
-    store.set_forward_phase("verifying")
-    store.claim_bingo_prize(1, "alice", 101)
-    sid = store.queue_forwarded_submission(2, "bob", 1, "2026-01-01T09:00:00")
-    store.set_forward_ready(sid)   # something still in flight
-    asyncio.run(bingo_forward.maybe_release(_ctx()))
-    bingo_forward._release_results.assert_not_awaited()
-
-
-def test_maybe_release_noop_outside_verifying_phase(store, monkeypatch):
-    from handlers import bingo_forward
-    monkeypatch.setattr(bingo_forward, "storage", store)
-    monkeypatch.setattr(bingo_forward, "_release_results", AsyncMock())
-    store.set_forward_phase("collecting")
-    asyncio.run(bingo_forward.maybe_release(_ctx()))
-    bingo_forward._release_results.assert_not_awaited()
+    ctx = _ctx()
+    asyncio.run(bingo_forward._release_results(ctx))
+    assert store.forward_phase() == "released"
+    ctx.bot.send_message.assert_not_awaited()
 
 
 # --- begin_round: broadcast + phase + deadline timer -----------------------
@@ -376,38 +374,35 @@ def test_begin_round_noop_when_round_already_in_progress(store, monkeypatch):
     ctx.job_queue.run_once.assert_not_called()      # deadline not re-armed
 
 
-# --- stuck-in-verifying regression: close with 0 ready, then a late confirm ---
+# --- late confirm mid-'verifying' still claims directly + releases ----------
 
-def test_late_confirm_during_verifying_promotes_to_pending(store, monkeypatch):
-    import config
+def test_late_confirm_during_verifying_claims_and_releases(store, monkeypatch):
+    """A confirm that lands while the round is 'verifying' (a slot still free)
+    claims the entry directly as a winner and releases the results — no
+    tagged-people verification."""
     from handlers import bingo, bingo_forward
     monkeypatch.setattr(bingo_forward, "storage", store)
     monkeypatch.setattr(store, "user_id_for_handle", lambda h: 1, raising=False)
-    monkeypatch.setattr(bingo, "_dm_subjects", AsyncMock())
-    monkeypatch.setattr(bingo, "_finalize", AsyncMock())
-    # Collection closes with ZERO 'ready' — only a 'fwd_confirming' entry (the
-    # person forwarded but hasn't tapped Confirm yet).
-    store.set_forward_phase("collecting")
+    monkeypatch.setattr(bingo, "_admin_recipient_ids", lambda: set())
+    store.set_forward_phase("verifying")
     sid = store.queue_forwarded_submission(100, "submitter", 1, "2026-01-01T09:00:00")
-    asyncio.run(bingo_forward.close_collection(_ctx()))
-    assert store.forward_phase() == "verifying"       # closed...
-    assert store.submission_status(sid) == "fwd_confirming"  # ...nothing promoted
-    # A confirm that lands AFTER the close must still drive the round forward.
     bingo_forward._PENDING_READ[sid] = {
         "read": {"cells": _cells(_TOP_ROW)}, "handle": "submitter", "sheet_no": 1}
     q = AsyncMock(); q.data = f"bingofwd:confirm:{sid}"; q.from_user = MagicMock(id=100)
     upd = MagicMock(); upd.callback_query = q
     ctx = _ctx(); ctx.job_queue = MagicMock()
     asyncio.run(bingo_forward.confirm_button(upd, ctx))
-    assert store.submission_status(sid) == "pending"  # promoted into verification
-    bingo._dm_subjects.assert_awaited_once()
+    assert store.submission_status(sid) == "verified"   # claimed directly
+    assert store.bingo_prizes_claimed() == 1
+    assert store.forward_phase() == "released"           # released after claim
+    assert sid not in bingo_forward._PENDING_READ         # cleaned up
 
 
-def test_forward_timeout_job_releases_when_nothing_ready_or_pending(store, monkeypatch):
+def test_forward_timeout_job_releases_when_nothing_ready(store, monkeypatch):
     from handlers import bingo_forward
     monkeypatch.setattr(bingo_forward, "storage", store)
-    # Already 'verifying' with nothing ready and nothing pending: the deadline
-    # backstop must settle the round instead of leaving it stuck forever.
+    # Already 'verifying' with nothing ready: the deadline backstop must settle
+    # the round instead of leaving it stuck forever.
     store.set_forward_phase("verifying")
     asyncio.run(bingo_forward._forward_timeout_job(_ctx()))
     assert store.forward_phase() == "released"

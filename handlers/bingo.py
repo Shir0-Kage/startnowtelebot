@@ -642,10 +642,6 @@ async def _finalize(context, submission_id, final=False):
         await _notify_submitter_failed(context, submission_id)
         from handlers import bingo_queue
         await bingo_queue.maybe_kickoff(context)
-        if storage.forward_phase() == "verifying":
-            from handlers import bingo_forward
-            await bingo_forward.kickoff_verification(context)
-            await bingo_forward.maybe_release(context)
         return
 
     await _award(context, submission_id)
@@ -721,12 +717,6 @@ async def _award(context, submission_id):
         _cancel_job(context, f"bingo:timeout:{submission_id}")
         # Then cancel any remaining pending subs' jobs.
         _cancel_outstanding_timeouts(context)
-
-    if storage.forward_batch_active():
-        # Forward round: hold all announcements; release them together at the end.
-        from handlers import bingo_forward
-        await bingo_forward.maybe_release(context)
-        return
 
     # channel post — best-effort, gated to once per slot
     try:

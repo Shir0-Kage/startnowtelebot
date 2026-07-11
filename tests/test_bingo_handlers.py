@@ -770,28 +770,6 @@ def test_confirm_button_caches_answer_game_wide(bingo, store):
     assert store.get_cached_confirmation(1, "likes cats") == "yes"
 
 
-# --- forward round: batch results hold announcements -----------------------
-
-def test_award_during_forward_batch_holds_announcements(bingo, store, monkeypatch):
-    from handlers import bingo_forward
-    monkeypatch.setattr(bingo_forward, "storage", store)
-    monkeypatch.setattr(bingo_forward, "maybe_release", AsyncMock())
-    store.set_forward_phase("verifying")
-
-    store.allocate_bingo_sheet(100, "alice")
-    sub_id = store.start_bingo_submission(100, "alice", store.get_bingo_sheet(100), 1)
-    store.record_winning_members(sub_id, [
-        {"row": 0, "col": 0, "handle": "bob", "prompt": "p0", "target_user_id": 1},
-    ])
-    ctx = _context()
-    asyncio.run(bingo._award(ctx, sub_id))
-
-    assert store.has_bingo_prize(100) is True
-    assert store.bingo_prizes_claimed() == 1
-    ctx.bot.send_message.assert_not_awaited()
-    bingo_forward.maybe_release.assert_awaited_once()
-
-
 # --- closing the game cancels outstanding timeout jobs ---------------------
 
 def test_award_at_limit_cancels_outstanding_timeouts(bingo, store, monkeypatch):
@@ -872,27 +850,6 @@ def test_failed_verification_promotes_next_queued(bingo, store, monkeypatch):
     assert store.submission_status(a) == "failed"
     assert store.submission_status(b) == "confirming"       # next promoted
     bingo_queue._PENDING_READ.pop(b, None)
-
-
-def test_failed_verification_promotes_next_ready_forward(bingo, store, monkeypatch):
-    # Forward round in 'verifying' phase: `a` is a forward submission already in
-    # tagged-people verification ('pending') with an all-unreachable line -> it
-    # FAILS. A 'ready' forward submission `b` sits behind it and should be
-    # promoted to 'pending' by the freed slot.
-    from handlers import bingo_forward
-    monkeypatch.setattr(bingo_forward, "storage", store)   # rebind, like bingo_queue above
-    store.set_forward_phase("verifying")
-    a = store.queue_forwarded_submission(1, "a", 1, "2026-01-01T09:00:00")
-    store.set_submission_status(a, "pending")
-    store.record_winning_members(a, [
-        {"row": 0, "col": c, "handle": h, "prompt": "p", "target_user_id": None}
-        for c, h in enumerate(["v", "w", "x", "y", "z"])])
-    b = store.queue_forwarded_submission(2, "b", 1, "2026-01-01T09:00:01")
-    store.set_forward_ready(b)
-    ctx = _context()
-    asyncio.run(bingo._finalize(ctx, a, final=True))        # no yeses -> fail
-    assert store.submission_status(a) == "failed"
-    assert store.submission_status(b) == "pending"           # next ready promoted
 
 
 # --- /import_bingo_queue facil command --------------------------------------

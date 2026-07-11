@@ -173,11 +173,11 @@ async def _mark_ready(context, submission_id, line, sheet_no):
         except Exception:
             pass
     # A confirm that lands AFTER collection has closed still has to drive the
-    # round: promote this fresh 'ready' into verification and check for release.
-    # During 'collecting' the phase guard skips this (kickoff happens at close).
+    # round: claim this fresh 'ready' entry (if a slot's free) and release.
+    # During 'collecting' the phase guard skips this (winners are picked at close).
     if storage.forward_phase() == "verifying":
-        await kickoff_verification(context)
-        await maybe_release(context)
+        await select_winners(context)
+        await _release_results(context)
     _PENDING_READ.pop(submission_id, None)
 
 
@@ -234,88 +234,67 @@ async def on_resend(context, uid, read):
 
 
 # ---------------------------------------------------------------------------
-# Collection close + verification kickoff (mirrors bingo_queue.maybe_kickoff /
-# _start_verification, but over the forward round's 'ready' rows).
+# Collection close + winner selection: a confirmed 5-in-a-row (all handles in
+# the roster) is a direct win. When the round closes we claim the earliest
+# 'ready' entries as prizes -- no tagged-people verification.
 # ---------------------------------------------------------------------------
 
 async def maybe_close_collection(context):
     """Close the collecting phase once FORWARD_ROUND_TARGET entries are in
-    (fwd_confirming + ready), then kick off verification of the earliest-ready
-    batch."""
+    (fwd_confirming + ready), then select winners and release."""
     if storage.forward_phase() == "collecting" and \
             storage.forward_entry_count() >= config.FORWARD_ROUND_TARGET:
         await close_collection(context)
 
 
 async def close_collection(context):
-    """Facil fallback / 2-day deadline: close collecting now and start
-    verifying whoever is ready."""
+    """Facil fallback / 20-entry trigger / 2-day deadline: close collecting,
+    claim the earliest-ready entries as winners, and release the results.
+    Idempotent -- a no-op once the round is 'released'."""
+    if storage.forward_phase() == "released":
+        return
     if storage.forward_phase() == "collecting":
         storage.set_forward_phase("verifying")
-    await kickoff_verification(context)
+    await select_winners(context)
+    await _release_results(context)   # DMs winners + admin summary, sets 'released'
 
 
-async def kickoff_verification(context):
-    """Promote 'ready' forward submissions into verification until the
-    BINGO_PRIZE_LIMIT in-flight slots are full."""
-    while storage.active_forward_verifying_count() < config.BINGO_PRIZE_LIMIT:
-        ready = storage.ready_in_order()
-        if not ready:
-            return
-        await _start_verification(context, ready[0])
-
-
-async def _start_verification(context, sub):
-    """A 'ready' forward submission is promoted: hand off to the existing
-    tagged-people pipeline (flip to 'pending', DM subjects, arm the 12h
-    timeout, evaluate). Members were already recorded at confirm (FR-T3), so
-    just read them back."""
-    from handlers import bingo                     # lazy: avoid import cycle
+async def _claim_winner(context, sub):
+    """Claim one 'ready' forward submission directly as a prize (no tagged-people
+    verification). On success mark it 'verified'; if the cap is already full or
+    it's a duplicate winner, mark it 'failed'."""
     sid = sub["id"]
-    members = storage.winning_members(sid)
-    storage.set_submission_status(sid, "pending")
-    # (No submitter DM here: _mark_ready already acknowledged them at 'ready';
-    # a second near-identical "you're in" DM at 'pending' would just repeat it.)
-    if getattr(context, "job_queue", None) is not None:
-        context.job_queue.run_once(
-            bingo._confirmation_timeout,
-            when=config.BINGO_CONFIRM_TIMEOUT,
-            data={"submission_id": sid},
-            name=f"bingo:timeout:{sid}",
-        )
-    await bingo._dm_subjects(context, sid, members)
-    await bingo._finalize(context, sid)
-    # handed off to the tagged-people pipeline; this module no longer needs the
-    # cached read, so evict it to bound _PENDING_READ growth.
+    claim_no = storage.claim_bingo_prize(
+        sub["submitter_user_id"], sub.get("submitter_handle") or "", sid)
+    if claim_no is not None:
+        storage.set_submission_status(sid, "verified", verified_at=storage._now_iso())
+    else:
+        storage.set_submission_status(sid, "failed")   # cap already full / dup
     _PENDING_READ.pop(sid, None)
 
 
+async def select_winners(context):
+    """Claim the earliest 'ready' entries (by original submit time) as winners,
+    up to the 10-prize cap."""
+    while storage.bingo_prizes_claimed() < config.BINGO_PRIZE_LIMIT:
+        ready = storage.ready_in_order()
+        if not ready:
+            return
+        await _claim_winner(context, ready[0])
+
+
 async def _forward_timeout_job(context):
-    """2-day forward-round deadline: close collecting even if under target, then
-    do a terminal release check. maybe_release HERE (at the deadline) fires the
-    0-ready / all-resolved case that would otherwise leave the round stuck in
-    'verifying' forever -- unlike inside close_collection, which must stay
-    release-free so the 20-forward close doesn't release with 0 winners."""
-    await close_collection(context)      # sets verifying + kickoff (no-op re-kick)
-    await maybe_release(context)         # deadline release: 0-ready / all-resolved
+    """2-day forward-round deadline: close collecting even if under target,
+    select winners and release."""
+    await close_collection(context)
 
 
 # ---------------------------------------------------------------------------
-# Batch results: hold every winner announcement until the round settles, then
-# release them all together (channel-free — DMs to winners + one admin
-# summary), instead of _award's normal one-at-a-time announcements.
+# Batch results: once winners are selected, release them all together
+# (channel-free — DMs to winners + one admin summary), instead of _award's
+# normal one-at-a-time announcements. May be called with 0 winners (an empty
+# or late round); that's fine (it DMs nobody and just sets 'released').
 # ---------------------------------------------------------------------------
-
-async def maybe_release(context):
-    """Release batched results when the 10 winners are settled, or when the round
-    has fully resolved with fewer."""
-    if storage.forward_phase() != "verifying":
-        return
-    done = (storage.bingo_prizes_claimed() >= config.BINGO_PRIZE_LIMIT
-            or (not storage.ready_in_order() and not storage.pending_submissions()))
-    if done:
-        await _release_results(context)
-
 
 async def _release_results(context):
     from handlers import bingo
@@ -381,24 +360,17 @@ def register(app):
     app.add_handler(CallbackQueryHandler(confirm_button, pattern=r"^bingofwd:confirm:"))
 
 
-async def _forward_resume_job(context):
-    """Restart resume: a round that was mid-'verifying' when the bot went down
-    has no live timer driving it, so re-run the kickoff + release check once so
-    it can promote any 'ready' left over and settle instead of hanging."""
-    await kickoff_verification(context)
-    await maybe_release(context)
-
-
 def rearm(app):
     """Re-arm the 2-day deadline if a collecting round was in progress at
-    restart; if a round was mid-'verifying', schedule a one-shot resume instead
-    so it doesn't stay stuck without a live timer to advance it."""
+    restart; if a round was stuck mid-'verifying', schedule a one-shot that
+    calls close_collection so it selects winners, releases, and settles instead
+    of staying stuck without a live timer to advance it."""
     jq = app.job_queue
     if jq is None:
         return
     phase = storage.forward_phase()
     if phase == "verifying":
-        jq.run_once(_forward_resume_job, when=3, name="bingo:forward_resume")
+        jq.run_once(close_collection, when=3, name="bingo:forward_resume")
         return
     if phase != "collecting":
         return
