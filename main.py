@@ -24,6 +24,7 @@ from handlers import (
     reminders,
     schedule,
     settings,
+    whistle,
 )
 from utils import watchdog
 
@@ -127,6 +128,7 @@ def main():
     attendance.register(app)
     announcements.register(app)
     provisioning.register(app)
+    whistle.register(app)
 
     app.add_error_handler(_on_error)
 

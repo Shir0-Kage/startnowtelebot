@@ -30,6 +30,7 @@ HELP_TEXT = (
     "<b>🎉 Human Bingo</b>\n"
     "/get_bingo — get your Human Bingo card and start playing\n"
     "/submit_bingo — send your filled card to check for a win 🏆\n\n"
+    "/whistle &lt;message&gt; — (DM me) send an anonymous report 🔔\n\n"
     "<b>For facilitators 🛠️</b>\n"
     "/setslot am|pm — set this group's meet-up slot\n"
     "/reminders on|off — toggle reminders for this group\n"
@@ -43,6 +44,7 @@ HELP_TEXT = (
     "/roster_status &lt;OG&gt; — (DM me) see who's in the group / waiting / not reachable\n"
     "/import_bingo_queue — re-queue everyone who's already submitted\n"
     "/start_forward_round — DM card-holders to forward their cards for the prize round\n"
+    "/start_whistle — open a new anonymous whistleblowing thread\n"
 )
 
 

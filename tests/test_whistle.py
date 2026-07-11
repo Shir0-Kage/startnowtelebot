@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from telegram.ext import CommandHandler, MessageHandler
 
 
 @pytest.fixture()
@@ -193,3 +194,25 @@ def test_whistle_rejects_empty_body(whistle, store):
     reply = upd.effective_message.reply_text.call_args[0][0]
     assert "/whistle" in reply
     ctx.bot.send_message.assert_not_called()
+
+
+# --- register wires the handlers --------------------------------------
+
+def test_register_adds_whistle_handlers(whistle):
+    app = MagicMock()
+    whistle.register(app)
+
+    command_calls = [
+        c for c in app.add_handler.call_args_list
+        if c.args and isinstance(c.args[0], CommandHandler)
+    ]
+    callbacks = {getattr(c.args[0], "callback", None) for c in command_calls}
+    assert whistle.start_whistle in callbacks
+    assert whistle.whistle in callbacks
+
+    forward_calls = [
+        c for c in app.add_handler.call_args_list
+        if c.args and isinstance(c.args[0], MessageHandler)
+        and getattr(c.args[0], "callback", None) is whistle.on_channel_autoforward
+    ]
+    assert forward_calls, "auto-forward MessageHandler was not registered"
