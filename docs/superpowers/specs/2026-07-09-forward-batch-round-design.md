@@ -14,6 +14,27 @@ The old bot discarded every bingo submission that wasn't a recognised winning li
 2. **Results are batched** — winner announcements are held and released all at once when the 10 winners are settled; @zzehao gets one message with all winners' handles. The per-win DMs from the winner-notify feature are suppressed during this round.
 3. **Keep the tagged-people check** — a line must still pass the "is this you?" verification to win. Verification runs strictly in **earliest-original-time order** (it starts when collection closes, not as each person confirms).
 
+## DESIGN REVISION (2026-07-09) — no tagged-people verification
+
+Decision 3 above is **superseded**: the "is this you?" tagged-people verification is
+**removed entirely**. New rule:
+
+- **A win = a confirmed 5-in-a-row where all 5 handles are roster handles** (i.e.
+  `bingo_lines.winning_lines` returns a line — it only ever does so when every cell is
+  a confident roster match). **No reachability requirement, no verification DMs.**
+- The self-confirmation step (short "here's your line — ✅ / fix it" or full fill-in
+  template) is **kept** so an OCR misread doesn't cost a real win — but the short vs
+  full choice now keys on **"a winning line exists"**, not "fully recognised/reachable".
+- A confirmed line → status `ready` (a valid winning entry).
+- **Winners = the earliest 10 `ready` entries by original forward-time.** At collection
+  close, they are selected, `claim_bingo_prize`d + set `verified`, and the batch release
+  fires immediately. There is **no `verifying` phase, no rolling replacement, and no
+  `_award` change** (the forward round claims prizes directly and never uses the
+  tagged-people `_finalize`/`_award` path).
+- Phases collapse to **`collecting → released`**.
+
+Everything below that references verification/`_award`/rolling is replaced by the above.
+
 ## Phases
 
 The round is a single game-wide state machine (stored in `bingo_flags`):
