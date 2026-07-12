@@ -223,6 +223,28 @@ def test_whistle_happy_path_posts_anonymously_and_confirms(whistle, store):
     assert "sent anonymously" in reply.lower()
 
 
+def _whistle_ready(store):
+    store.set_whistle_link(-100123, -100456)
+    store.set_whistle_pending(77)
+    store.resolve_whistle_anchor(77, 500)  # (group_id, anchor) == (-100456, 500)
+
+
+def test_whistle_stores_undo_handle_and_mentions_undo(whistle, store):
+    _whistle_ready(store)
+    upd = _update(chat_type="private", text="/whistle a concern")
+    ctx = _context()
+    ctx.user_data = {}
+    ctx.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=555))
+
+    asyncio.run(whistle.whistle(upd, ctx))
+
+    # only message ids are remembered (in-memory), never the sender's identity
+    assert ctx.user_data["last_whistle"] == {"chat_id": -100456, "message_id": 555}
+    reply = upd.effective_message.reply_text.call_args[0][0]
+    assert "sent anonymously" in reply.lower()
+    assert "/undo_whistle" in reply
+
+
 def test_whistle_rejects_empty_body(whistle, store):
     store.set_whistle_link(-100123, -100456)
     store.set_whistle_pending(77)
@@ -238,6 +260,48 @@ def test_whistle_rejects_empty_body(whistle, store):
     ctx.bot.send_message.assert_not_called()
 
 
+# --- undo_whistle -----------------------------------------------------------
+
+def test_undo_deletes_last_report_and_clears(whistle):
+    upd = _update(chat_type="private", text="/undo_whistle")
+    ctx = _context()
+    ctx.user_data = {"last_whistle": {"chat_id": -100456, "message_id": 555}}
+    ctx.bot.delete_message = AsyncMock()
+
+    asyncio.run(whistle.undo_whistle(upd, ctx))
+
+    ctx.bot.delete_message.assert_awaited_once_with(chat_id=-100456, message_id=555)
+    assert "last_whistle" not in ctx.user_data
+    reply = upd.effective_message.reply_text.call_args[0][0]
+    assert "removed" in reply.lower()
+
+
+def test_undo_with_nothing_to_remove(whistle):
+    upd = _update(chat_type="private", text="/undo_whistle")
+    ctx = _context()
+    ctx.user_data = {}
+    ctx.bot.delete_message = AsyncMock()
+
+    asyncio.run(whistle.undo_whistle(upd, ctx))
+
+    ctx.bot.delete_message.assert_not_called()
+    reply = upd.effective_message.reply_text.call_args[0][0]
+    assert "nothing to undo" in reply.lower()
+
+
+def test_undo_refuses_outside_private_chat(whistle):
+    upd = _update(chat_type="group", text="/undo_whistle")
+    ctx = _context()
+    ctx.user_data = {"last_whistle": {"chat_id": -100456, "message_id": 555}}
+    ctx.bot.delete_message = AsyncMock()
+
+    asyncio.run(whistle.undo_whistle(upd, ctx))
+
+    ctx.bot.delete_message.assert_not_called()
+    reply = upd.effective_message.reply_text.call_args[0][0]
+    assert "private" in reply.lower() or "dm" in reply.lower()
+
+
 # --- register wires the handlers --------------------------------------
 
 def test_register_adds_whistle_handlers(whistle):
@@ -251,6 +315,7 @@ def test_register_adds_whistle_handlers(whistle):
     callbacks = {getattr(c.args[0], "callback", None) for c in command_calls}
     assert whistle.start_whistle in callbacks
     assert whistle.whistle in callbacks
+    assert whistle.undo_whistle in callbacks
 
     forward_calls = [
         c for c in app.add_handler.call_args_list

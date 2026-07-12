@@ -85,7 +85,7 @@ async def whistle(update, context):
             "No whistle thread is open right now — ask an admin to run /start_whistle.")
         return
     try:
-        await context.bot.send_message(
+        posted = await context.bot.send_message(
             chat_id=group_id,
             text="🔔 Anonymous report:\n\n" + text,
             reply_to_message_id=anchor)
@@ -95,12 +95,50 @@ async def whistle(update, context):
         await update.effective_message.reply_text(
             "Something went wrong sending that — please try again in a moment.")
         return
-    await update.effective_message.reply_text("Sent anonymously ✅")
+    # Remember just enough for THIS sender to undo THEIR last report. This lives
+    # only in PTB's in-memory user_data — no persistence backend is configured,
+    # so it is never written to disk, our DB, or the logs, and it disappears on
+    # restart. We store only message ids, never the sender's identity, so
+    # anonymity toward the channel and the logs is unchanged.
+    if context.user_data is not None:
+        context.user_data["last_whistle"] = {
+            "chat_id": group_id, "message_id": posted.message_id}
+    await update.effective_message.reply_text(
+        "Sent anonymously ✅\n\nChanged your mind? Send /undo_whistle to take it back.")
+
+
+async def undo_whistle(update, context):
+    """Delete the sender's most recent whistle. Works only right after sending
+    (the undo handle is in-memory and cleared on restart), and only for the
+    person's own last report — no sender identity is ever stored or logged."""
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        await update.effective_message.reply_text(
+            "DM me privately to undo a report 🙏")
+        return
+    last = (context.user_data or {}).get("last_whistle")
+    if not last:
+        await update.effective_message.reply_text(
+            "Nothing to undo — I don't have a recent report from you to remove. "
+            "(Undo only works right after sending, and not once I've restarted.)")
+        return
+    try:
+        await context.bot.delete_message(
+            chat_id=last["chat_id"], message_id=last["message_id"])
+    except Exception as exc:
+        # never log the sender — only the failure reason.
+        log.warning("couldn't undo whistle: %s", exc)
+        await update.effective_message.reply_text(
+            "Couldn't remove it — it may already be gone. If not, try again shortly.")
+        return
+    context.user_data.pop("last_whistle", None)
+    await update.effective_message.reply_text("Your last report has been removed ✅")
 
 
 def register(app):
     app.add_handler(CommandHandler("start_whistle", start_whistle))
     app.add_handler(CommandHandler("whistle", whistle))
+    app.add_handler(CommandHandler("undo_whistle", undo_whistle))
     # learn the channel id from posts in the channel itself; and the group id +
     # anchor from the auto-forwarded copy in the discussion group. Distinct update
     # types (channel post vs. supergroup message) so they never collide. group=1
