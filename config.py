@@ -46,6 +46,13 @@ def _parse_handles(raw):
 FACILITATOR_HANDLES = {"zzehao"} | _parse_handles(os.environ.get("FACILITATOR_HANDLES"))
 
 
+# Anonymous whistleblowing reports are DM'd to these organisers (by @username;
+# each must have /started the bot so we can reach them). Override/add with
+# WHISTLE_RECIPIENTS in .env, e.g. WHISTLE_RECIPIENTS=alice,bob.
+WHISTLE_RECIPIENTS = ({"zzehao", "jvsoh", "dxnellek"}
+                      | _parse_handles(os.environ.get("WHISTLE_RECIPIENTS")))
+
+
 # --- Time ------------------------------------------------------------------
 # Everything StartNOW! runs on Singapore time.
 SGT = ZoneInfo("Asia/Singapore")

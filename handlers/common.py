@@ -30,7 +30,7 @@ HELP_TEXT = (
     "<b>🎉 Human Bingo</b>\n"
     "/get_bingo — get your Human Bingo card and start playing\n"
     "/submit_bingo — send your filled card to check for a win 🏆\n\n"
-    "/whistle &lt;message&gt; — (DM me) send an anonymous report 🔔\n"
+    "/whistle &lt;message&gt; — (DM me) send an anonymous report to the organisers 🔔\n"
     "/undo_whistle — (DM me) take back your last anonymous report\n\n"
     "<b>For facilitators 🛠️</b>\n"
     "/setslot am|pm — set this group's meet-up slot\n"
@@ -45,8 +45,6 @@ HELP_TEXT = (
     "/roster_status &lt;OG&gt; — (DM me) see who's in the group / waiting / not reachable\n"
     "/import_bingo_queue — re-queue everyone who's already submitted\n"
     "/start_forward_round — DM card-holders to forward their cards for the prize round\n"
-    "/start_whistle — open a new anonymous whistleblowing thread\n"
-    "/set_whistle_base &lt;link&gt; — (DM me) use an existing channel post as the whistle base\n"
 )
 
 
