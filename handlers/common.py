@@ -46,6 +46,7 @@ HELP_TEXT = (
     "/import_bingo_queue — re-queue everyone who's already submitted\n"
     "/start_forward_round — DM card-holders to forward their cards for the prize round\n"
     "/start_whistle — open a new anonymous whistleblowing thread\n"
+    "/set_whistle_base &lt;link&gt; — (DM me) use an existing channel post as the whistle base\n"
 )
 
 

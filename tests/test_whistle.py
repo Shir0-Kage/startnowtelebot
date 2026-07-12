@@ -79,6 +79,22 @@ def test_autoforward_captures_link_and_resolves_matching_pending(whistle, store)
     assert store.get_whistle_anchor() == (-100456, 500)
 
 
+def test_autoforward_remembers_forward_map(whistle, store):
+    upd = MagicMock()
+    msg = MagicMock()
+    msg.is_automatic_forward = True
+    msg.forward_from_chat = SimpleNamespace(id=-100123)
+    msg.sender_chat = None
+    msg.forward_from_message_id = 29
+    msg.message_id = 812
+    msg.chat = SimpleNamespace(id=-100456)
+    upd.effective_message = msg
+
+    asyncio.run(whistle.on_channel_autoforward(upd, _context()))
+
+    assert store.lookup_forward(29) == (-100456, 812)
+
+
 def test_autoforward_ignores_non_forwarded_message(whistle, store):
     upd = MagicMock()
     msg = MagicMock()
@@ -172,6 +188,58 @@ def test_start_whistle_linked_posts_base_and_sets_pending(whistle, store, monkey
     assert row["pending_channel_msg_id"] == 321
     reply = upd.effective_message.reply_text.call_args[0][0]
     assert "posted" in reply.lower()
+
+
+# --- set_whistle_base --------------------------------------------------------
+
+def test_base_msg_id_parses_link_and_bare_number(whistle):
+    assert whistle._base_msg_id("https://t.me/c/4292606016/29") == 29
+    assert whistle._base_msg_id("/set_whistle_base 29") == 29
+    assert whistle._base_msg_id("no numbers here") is None
+
+
+def test_set_base_blocks_non_admin(whistle, monkeypatch):
+    monkeypatch.setattr(whistle, "is_admin", lambda user: False)
+    upd = _update(chat_type="private", text="/set_whistle_base https://t.me/c/4292606016/29")
+    ctx = _context()
+
+    asyncio.run(whistle.set_whistle_base(upd, ctx))
+
+    assert "admin" in upd.effective_message.reply_text.call_args[0][0].lower()
+
+
+def test_set_base_requires_private(whistle, monkeypatch):
+    monkeypatch.setattr(whistle, "is_admin", lambda user: True)
+    upd = _update(chat_type="group", text="/set_whistle_base https://t.me/c/4292606016/29")
+    ctx = _context()
+
+    asyncio.run(whistle.set_whistle_base(upd, ctx))
+
+    assert "dm me" in upd.effective_message.reply_text.call_args[0][0].lower()
+
+
+def test_set_base_unknown_post_not_seen(whistle, store, monkeypatch):
+    monkeypatch.setattr(whistle, "is_admin", lambda user: True)
+    upd = _update(chat_type="private", text="/set_whistle_base https://t.me/c/4292606016/29")
+    ctx = _context()
+
+    asyncio.run(whistle.set_whistle_base(upd, ctx))
+
+    reply = upd.effective_message.reply_text.call_args[0][0].lower()
+    assert "haven't seen" in reply
+    assert store.get_whistle_anchor() == (None, None)  # anchor left untouched
+
+
+def test_set_base_happy_path_adopts_group_copy_as_anchor(whistle, store, monkeypatch):
+    monkeypatch.setattr(whistle, "is_admin", lambda user: True)
+    store.remember_forward(29, -100456, 812)  # bot saw the auto-forward earlier
+    upd = _update(chat_type="private", text="/set_whistle_base https://t.me/c/4292606016/29")
+    ctx = _context()
+
+    asyncio.run(whistle.set_whistle_base(upd, ctx))
+
+    assert store.get_whistle_anchor() == (-100456, 812)
+    assert "base message set" in upd.effective_message.reply_text.call_args[0][0].lower()
 
 
 # --- whistle -------------------------------------------------------------
@@ -314,6 +382,7 @@ def test_register_adds_whistle_handlers(whistle):
     ]
     callbacks = {getattr(c.args[0], "callback", None) for c in command_calls}
     assert whistle.start_whistle in callbacks
+    assert whistle.set_whistle_base in callbacks
     assert whistle.whistle in callbacks
     assert whistle.undo_whistle in callbacks
 

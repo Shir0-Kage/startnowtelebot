@@ -171,6 +171,16 @@ CREATE TABLE IF NOT EXISTS whistle (
     pending_channel_msg_id INTEGER,
     updated_at             TEXT
 );
+
+-- Recent channel-post -> discussion-group-copy mapping, learned from
+-- auto-forwards. Lets an admin adopt an existing post as the base via its link
+-- (/set_whistle_base). Holds only message ids — no whistleblower identity.
+CREATE TABLE IF NOT EXISTS whistle_forward (
+    channel_msg_id INTEGER PRIMARY KEY,
+    group_id       INTEGER,
+    group_msg_id   INTEGER,
+    seen_at        TEXT
+);
 """
 
 
@@ -1051,3 +1061,44 @@ def get_whistle_anchor():
     if not row or row.get("anchor_msg_id") is None:
         return (None, None)
     return (row["group_id"], row["anchor_msg_id"])
+
+
+def set_whistle_anchor(group_id, anchor_msg_id):
+    """Point the active anchor at a specific discussion-group message (used when
+    an admin adopts an existing post as the base). Clears any pending post."""
+    with _lock:
+        _conn.execute(
+            "INSERT INTO whistle (id, group_id, anchor_msg_id, "
+            "pending_channel_msg_id, updated_at) VALUES (1, ?, ?, NULL, ?) "
+            "ON CONFLICT(id) DO UPDATE SET group_id=excluded.group_id, "
+            "anchor_msg_id=excluded.anchor_msg_id, pending_channel_msg_id=NULL, "
+            "updated_at=excluded.updated_at",
+            (group_id, anchor_msg_id, _now_iso()))
+        _conn.commit()
+
+
+def remember_forward(channel_msg_id, group_id, group_msg_id):
+    """Record a channel post's discussion-group copy, seen via its auto-forward,
+    so an admin can later adopt it as the base by its link. Kept to the most
+    recent 200 posts."""
+    with _lock:
+        _conn.execute(
+            "INSERT INTO whistle_forward "
+            "(channel_msg_id, group_id, group_msg_id, seen_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(channel_msg_id) DO UPDATE SET group_id=excluded.group_id, "
+            "group_msg_id=excluded.group_msg_id, seen_at=excluded.seen_at",
+            (channel_msg_id, group_id, group_msg_id, _now_iso()))
+        _conn.execute(
+            "DELETE FROM whistle_forward WHERE channel_msg_id NOT IN "
+            "(SELECT channel_msg_id FROM whistle_forward "
+            "ORDER BY seen_at DESC LIMIT 200)")
+        _conn.commit()
+
+
+def lookup_forward(channel_msg_id):
+    """The (group_id, group_msg_id) copy of a channel post, or (None, None)."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT group_id, group_msg_id FROM whistle_forward "
+            "WHERE channel_msg_id = ?", (channel_msg_id,)).fetchone()
+    return (row["group_id"], row["group_msg_id"]) if row else (None, None)

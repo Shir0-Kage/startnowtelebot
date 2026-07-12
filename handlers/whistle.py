@@ -6,6 +6,7 @@ the sender. The bot learns the channel id directly from any post in the channel
 of a post (it is an admin in the discussion group too)."""
 
 import logging
+import re
 
 from telegram.ext import CommandHandler, MessageHandler, filters
 
@@ -40,6 +41,10 @@ async def on_channel_autoforward(update, context):
         return
     storage.set_whistle_link(origin.id, msg.chat.id)
     if msg.forward_from_message_id is not None:
+        # remember this post's group copy so an admin can later adopt it as the
+        # base via its link (/set_whistle_base), and resolve a pending anchor.
+        storage.remember_forward(
+            msg.forward_from_message_id, msg.chat.id, msg.message_id)
         storage.resolve_whistle_anchor(msg.forward_from_message_id, msg.message_id)
 
 
@@ -64,6 +69,44 @@ async def start_whistle(update, context):
     storage.set_whistle_pending(post.message_id)
     await update.effective_message.reply_text(
         "Whistle thread posted 🔔 — anonymous reports will appear as comments under it.")
+
+
+def _base_msg_id(text):
+    """The channel message id from a t.me link (or a bare number) — the last
+    run of digits, e.g. https://t.me/c/4292606016/29 -> 29. None if none."""
+    nums = re.findall(r"\d+", text or "")
+    return int(nums[-1]) if nums else None
+
+
+async def set_whistle_base(update, context):
+    """Admin adopts an existing channel post (by its link) as the whistle base.
+    The post must already have auto-forwarded into the discussion group so the
+    bot knows its group-side copy to reply under."""
+    if not is_admin(update.effective_user):
+        await update.effective_message.reply_text(
+            "Only an admin can set the whistle base message.")
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        await update.effective_message.reply_text(
+            "DM me the base message link:  /set_whistle_base <link>")
+        return
+    parts = (update.effective_message.text or "").split(maxsplit=1)
+    msg_id = _base_msg_id(parts[1]) if len(parts) > 1 else None
+    if msg_id is None:
+        await update.effective_message.reply_text(
+            "Send it like:  /set_whistle_base https://t.me/c/.../<id>")
+        return
+    group_id, group_msg_id = storage.lookup_forward(msg_id)
+    if group_id is None:
+        await update.effective_message.reply_text(
+            "I haven't seen that post arrive in the discussion group yet. Post the "
+            "base message while I'm running (and make sure I'm an admin in the "
+            "linked discussion group), then send its link again.")
+        return
+    storage.set_whistle_anchor(group_id, group_msg_id)
+    await update.effective_message.reply_text(
+        "Base message set 🔔 — anonymous reports will now appear as comments under it.")
 
 
 async def whistle(update, context):
@@ -137,6 +180,7 @@ async def undo_whistle(update, context):
 
 def register(app):
     app.add_handler(CommandHandler("start_whistle", start_whistle))
+    app.add_handler(CommandHandler("set_whistle_base", set_whistle_base))
     app.add_handler(CommandHandler("whistle", whistle))
     app.add_handler(CommandHandler("undo_whistle", undo_whistle))
     # learn the channel id from posts in the channel itself; and the group id +
