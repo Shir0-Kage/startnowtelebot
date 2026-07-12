@@ -1,8 +1,9 @@
 """Anonymous whistleblowing. An admin opens a thread (a base post in the linked
 channel); anyone DMs /whistle <text> and the bot posts it as a comment under that
 post (a reply in the channel's discussion group) WITHOUT ever revealing or logging
-the sender. The bot auto-learns the channel + discussion-group ids from the first
-auto-forwarded channel post (it is an admin in the discussion group)."""
+the sender. The bot learns the channel id directly from any post in the channel
+(it is a channel admin), and the discussion-group id from the auto-forwarded copy
+of a post (it is an admin in the discussion group too)."""
 
 import logging
 
@@ -16,6 +17,16 @@ log = logging.getLogger(__name__)
 _BASE_TEXT = ("🔔 Anonymous whistleblowing is open.\n\n"
              "DM me  /whistle <your message>  and it'll appear here anonymously — "
              "your name is never shown or logged.")
+
+
+async def on_channel_post(update, context):
+    """A post in the channel itself (the bot is a channel admin) — learn the
+    channel id directly so /start_whistle can open a thread without waiting for
+    an auto-forward. Includes the base message the bot posts (harmless re-store)."""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    storage.set_whistle_channel(chat.id)
 
 
 async def on_channel_autoforward(update, context):
@@ -90,8 +101,12 @@ async def whistle(update, context):
 def register(app):
     app.add_handler(CommandHandler("start_whistle", start_whistle))
     app.add_handler(CommandHandler("whistle", whistle))
-    # capture auto-forwarded channel posts in the discussion group (group=1 so it
-    # never shadows the other group handlers).
+    # learn the channel id from posts in the channel itself; and the group id +
+    # anchor from the auto-forwarded copy in the discussion group. Distinct update
+    # types (channel post vs. supergroup message) so they never collide. group=1
+    # so neither shadows the other group handlers.
+    app.add_handler(
+        MessageHandler(filters.ChatType.CHANNEL, on_channel_post), group=1)
     app.add_handler(
         MessageHandler(filters.IS_AUTOMATIC_FORWARD, on_channel_autoforward),
         group=1)

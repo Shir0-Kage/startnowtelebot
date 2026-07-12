@@ -90,6 +90,48 @@ def test_autoforward_ignores_non_forwarded_message(whistle, store):
     assert store.get_whistle_link() == (None, None)
 
 
+# --- on_channel_post --------------------------------------------------------
+
+def test_channel_post_captures_channel_id(whistle, store):
+    upd = MagicMock()
+    upd.effective_chat = SimpleNamespace(id=-100123, type="channel")
+    upd.effective_message = MagicMock()
+
+    asyncio.run(whistle.on_channel_post(upd, _context()))
+
+    channel_id, _group = store.get_whistle_link()
+    assert channel_id == -100123
+
+
+def test_channel_post_lets_start_whistle_open_without_autoforward(whistle, store, monkeypatch):
+    # the bot only ever saw a channel post (no discussion-group auto-forward yet)
+    post = MagicMock()
+    post.effective_chat = SimpleNamespace(id=-100123, type="channel")
+    post.effective_message = MagicMock()
+    asyncio.run(whistle.on_channel_post(post, _context()))
+
+    monkeypatch.setattr(whistle, "is_admin", lambda user: True)
+    upd = _update(chat_type="group")
+    ctx = _context()
+    ctx.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=321))
+
+    asyncio.run(whistle.start_whistle(upd, ctx))
+
+    ctx.bot.send_message.assert_awaited_once_with(chat_id=-100123, text=whistle._BASE_TEXT)
+    assert store._whistle_row()["pending_channel_msg_id"] == 321
+
+
+def test_channel_post_preserves_known_group_id(whistle, store):
+    store.set_whistle_link(-100123, -100456)  # both already known
+    upd = MagicMock()
+    upd.effective_chat = SimpleNamespace(id=-100123, type="channel")
+    upd.effective_message = MagicMock()
+
+    asyncio.run(whistle.on_channel_post(upd, _context()))
+
+    assert store.get_whistle_link() == (-100123, -100456)  # group_id untouched
+
+
 # --- start_whistle -----------------------------------------------------------
 
 def test_start_whistle_blocks_non_admin(whistle, monkeypatch):
@@ -216,3 +258,10 @@ def test_register_adds_whistle_handlers(whistle):
         and getattr(c.args[0], "callback", None) is whistle.on_channel_autoforward
     ]
     assert forward_calls, "auto-forward MessageHandler was not registered"
+
+    post_calls = [
+        c for c in app.add_handler.call_args_list
+        if c.args and isinstance(c.args[0], MessageHandler)
+        and getattr(c.args[0], "callback", None) is whistle.on_channel_post
+    ]
+    assert post_calls, "channel-post MessageHandler was not registered"

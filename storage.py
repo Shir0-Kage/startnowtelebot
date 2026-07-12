@@ -1003,6 +1003,19 @@ def set_whistle_link(channel_id, group_id):
         _conn.commit()
 
 
+def set_whistle_channel(channel_id):
+    """Record just the channel id — learned from a direct channel post the bot
+    sees as a channel admin — leaving any already-known group_id untouched."""
+    with _lock:
+        _conn.execute(
+            "INSERT INTO whistle (id, channel_id, updated_at) "
+            "VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET channel_id=excluded.channel_id, "
+            "updated_at=excluded.updated_at",
+            (channel_id, _now_iso()))
+        _conn.commit()
+
+
 def get_whistle_link():
     row = _whistle_row()
     return (row["channel_id"], row["group_id"]) if row else (None, None)
