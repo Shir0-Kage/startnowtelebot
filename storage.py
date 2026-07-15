@@ -924,6 +924,14 @@ def set_forward_phase(phase):
         _conn.commit()
 
 
+def reset_forward_round():
+    """Clear every forward-round phase flag so a fresh round can be opened
+    (phases are cumulative flags, so a leftover 'released' otherwise sticks)."""
+    with _lock:
+        _conn.execute("DELETE FROM bingo_flags WHERE name LIKE 'forward_%'")
+        _conn.commit()
+
+
 def forward_phase():
     with _lock:
         rows = {r["name"] for r in _conn.execute(

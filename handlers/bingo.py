@@ -428,13 +428,6 @@ async def on_bingo_text(update, context):
     if chat is None or chat.type != "private":
         return
     uid = update.effective_user.id
-    if storage.forward_phase() == "collecting" and storage.fwd_confirming_for(uid):
-        sheet_no = storage.get_bingo_sheet(uid)
-        if sheet_no is not None:
-            read = bingo_text.parse_submission(
-                sheet_no, update.effective_message.text or "", _roster_index())
-            await bingo_forward.on_resend(context, uid, read)
-        return
     awaiting = context.user_data.get("awaiting_bingo_text")
     confirming = any(s["submitter_user_id"] == uid
                      for s in storage.confirming_submissions())
@@ -879,12 +872,36 @@ async def start_forward_round(update, context):
         f"Forward round started — messaged {n} card-holder(s) to forward their cards. 📸")
 
 
+async def confirm_bingo_winners(update, context):
+    """@zzehao-only: confirm the bingo winners by their @handles. DMs each winner
+    a congratulations and sends @zzehao an announcement to vet + post."""
+    user = update.effective_user
+    handle = sheets.normalize_handle(user.username or "") if user else None
+    if handle != bingo_forward.VETTER_HANDLE:
+        await update.effective_message.reply_text(
+            f"Only @{bingo_forward.VETTER_HANDLE} can confirm the bingo winners.")
+        return
+    handles = [p for p in (update.effective_message.text or "").split()[1:] if p.strip()]
+    if not handles:
+        await update.effective_message.reply_text(
+            "List the winners like:  /confirm_bingo_winners @alice @bob @carol")
+        return
+    winners, unreachable = await bingo_forward.confirm_winners(context, handles)
+    lines = [f"Confirmed {len(winners)} winner(s) — DMed them and sent you the "
+             "announcement to post. ✅"]
+    if unreachable:
+        lines.append("Couldn't reach (they may not have messaged me yet): "
+                     + ", ".join(f"@{h}" for h in unreachable))
+    await update.effective_message.reply_text("\n".join(lines))
+
+
 def register(app):
     app.add_handler(CommandHandler("get_bingo", get_bingo))
     app.add_handler(CommandHandler("submit_bingo", submit_bingo))
     app.add_handler(CommandHandler("close_bingo_round", close_bingo_round))
     app.add_handler(CommandHandler("import_bingo_queue", import_bingo_queue))
     app.add_handler(CommandHandler("start_forward_round", start_forward_round))
+    app.add_handler(CommandHandler("confirm_bingo_winners", confirm_bingo_winners))
     app.add_handler(CallbackQueryHandler(confirm_button, pattern=r"^bingoconf:"))
     app.add_handler(CallbackQueryHandler(bingo_mode_button, pattern=r"^bingomode:"))
     app.add_handler(CallbackQueryHandler(bingo_ocr_confirm_button, pattern=r"^bingoocr:"))
