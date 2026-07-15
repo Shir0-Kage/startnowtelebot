@@ -37,7 +37,7 @@ HELP_TEXT = (
     "/reminders on|off — toggle reminders for this group\n"
     "/attendance &lt;event&gt; — post an attendance poll for an event\n"
     "/close_attendance &lt;event&gt; — close the poll\n"
-    "/announce &lt;message&gt; — post a formatted announcement\n"
+    "/announce &lt;message&gt; — (DM me) broadcast your message word-for-word to every group\n"
     "/remind &lt;message&gt; — post a short reminder\n"
     "/pinannounce &lt;message&gt; — announce and pin it\n"
     "/add_year_ones — add this group's Year 1s (from the sheet)\n"

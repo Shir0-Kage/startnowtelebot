@@ -267,6 +267,13 @@ def set_reminders(chat_id, enabled):
         _conn.commit()
 
 
+def all_groups():
+    """Every group chat the bot knows about (regardless of reminder settings)."""
+    with _lock:
+        rows = _conn.execute("SELECT * FROM groups").fetchall()
+    return [dict(r) for r in rows]
+
+
 def groups_with_reminders():
     """All chats that currently want reminders."""
     with _lock:
