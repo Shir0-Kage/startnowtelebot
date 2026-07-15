@@ -54,6 +54,7 @@ def _ctx():
 def test_announce_broadcasts_verbatim_to_every_group(ann, store):
     store.ensure_group(-100, "AM Group")
     store.ensure_group(-200, "PM Group")
+    store.ensure_group(777, "A DM'd Person")     # private chat (positive id)
     body = "Meet Up 1 is on <b>tomorrow</b> at 10am!"
     upd = _update("/announce " + body)
     ctx = _ctx()
@@ -61,7 +62,7 @@ def test_announce_broadcasts_verbatim_to_every_group(ann, store):
     asyncio.run(ann.announce_command(upd, ctx))
 
     targets = {c.kwargs["chat_id"] for c in ctx.bot.send_message.call_args_list}
-    assert targets == {-100, -200}
+    assert targets == {-100, -200}               # groups only, never the DM (777)
     for c in ctx.bot.send_message.call_args_list:
         # verbatim: exact text, no header/footer, no HTML parse_mode
         assert c.kwargs["text"] == body

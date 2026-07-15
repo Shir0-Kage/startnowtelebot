@@ -268,9 +268,12 @@ def set_reminders(chat_id, enabled):
 
 
 def all_groups():
-    """Every group chat the bot knows about (regardless of reminder settings)."""
+    """Every GROUP/supergroup chat the bot knows about, regardless of reminder
+    settings. Excludes private chats: Telegram group ids are negative, whereas a
+    private chat's id is a positive user id — and /start records DMs in this same
+    table — so a `chat_id < 0` filter keeps individuals out of group broadcasts."""
     with _lock:
-        rows = _conn.execute("SELECT * FROM groups").fetchall()
+        rows = _conn.execute("SELECT * FROM groups WHERE chat_id < 0").fetchall()
     return [dict(r) for r in rows]
 
 
