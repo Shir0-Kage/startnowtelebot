@@ -69,6 +69,18 @@ def test_announce_broadcasts_verbatim_to_every_group(ann, store):
     assert "2 group" in upd.effective_message.reply_text.call_args[0][0]
 
 
+def test_announce_rejects_non_zzehao(ann, store):
+    store.ensure_group(-100, "AM Group")
+    upd = _update("/announce hi")
+    upd.effective_user = SimpleNamespace(id=2, username="aria", full_name="Aria")
+    ctx = _ctx()
+
+    asyncio.run(ann.announce_command(upd, ctx))
+
+    ctx.bot.send_message.assert_not_called()
+    assert "zzehao" in upd.effective_message.reply_text.call_args[0][0].lower()
+
+
 def test_announce_refuses_in_group_chat(ann, store):
     store.ensure_group(-100, "AM Group")
     upd = _update("/announce hi", chat_type="supergroup")

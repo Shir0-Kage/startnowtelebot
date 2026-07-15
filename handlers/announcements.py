@@ -9,6 +9,9 @@ import storage
 from utils.auth import facil_only
 from utils.text import chunk_text
 
+# /announce broadcasts to every group, so it's locked to the lead organiser only.
+ANNOUNCER_HANDLE = "zzehao"
+
 ANNOUNCE_HEADER = "📣 <b>Group Announcement</b>"
 ANNOUNCE_FOOTER = "Please check this chat for any updates. See y'all there ❤️"
 REMIND_HEADER = "⏰ <b>Quick Reminder</b>"
@@ -34,10 +37,15 @@ async def _send_chunks(message, full_text):
     return first
 
 
-@facil_only
 async def announce_command(update, context):
-    """DM-only. Send the message verbatim (word for word, no header/footer) to
-    every group the bot is in."""
+    """@zzehao-only, DM-only. Send the message verbatim (word for word, no
+    header/footer) to every group the bot is in."""
+    user = update.effective_user
+    handle = (user.username or "").lstrip("@").lower() if user else ""
+    if handle != ANNOUNCER_HANDLE:
+        await update.effective_message.reply_text(
+            f"Only @{ANNOUNCER_HANDLE} can use /announce.")
+        return
     chat = update.effective_chat
     if chat is not None and chat.type != "private":
         await update.effective_message.reply_text(
