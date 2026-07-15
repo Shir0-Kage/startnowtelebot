@@ -81,6 +81,76 @@ async def announce_command(update, context):
     await update.effective_message.reply_text(summary)
 
 
+async def purge_dm_chats_command(update, context):
+    """@zzehao-only: delete individual DM chats that got recorded as groups (via
+    /start etc.), keeping the real group chats. A one-off cleanup so group
+    broadcasts can never touch individuals."""
+    user = update.effective_user
+    handle = (user.username or "").lstrip("@").lower() if user else ""
+    if handle != ANNOUNCER_HANDLE:
+        await update.effective_message.reply_text(
+            f"Only @{ANNOUNCER_HANDLE} can use /purge_dm_chats.")
+        return
+    n = storage.delete_dm_chats()
+    await update.effective_message.reply_text(
+        f"🧹 Removed {n} individual DM chat(s) from the group list — real group "
+        "chats are untouched.")
+
+
+async def purge_dm_messages_command(update, context):
+    """@zzehao-only: delete the most recent bot message from every individual DM
+    the bot recorded (i.e. everyone a pre-fix /announce reached one-on-one), so a
+    stray announcement is removed from people's DMs. Group chats are never
+    touched. Optional count (default 1, max 5) removes that many recent bot
+    messages per DM. Best-effort: it targets the latest message(s), so run it
+    promptly and be aware it can catch another recent bot message if the person
+    interacted after the announcement."""
+    user = update.effective_user
+    handle = (user.username or "").lstrip("@").lower() if user else ""
+    if handle != ANNOUNCER_HANDLE:
+        await update.effective_message.reply_text(
+            f"Only @{ANNOUNCER_HANDLE} can use /purge_dm_messages.")
+        return
+
+    parts = (update.effective_message.text or "").split()
+    count = 1
+    if len(parts) > 1 and parts[1].isdigit():
+        count = max(1, min(int(parts[1]), 5))
+
+    dm_ids = storage.dm_chat_ids()
+    if not dm_ids:
+        await update.effective_message.reply_text(
+            "No individual DM chats on record to clean up.")
+        return
+
+    swept = deleted = 0
+    for cid in dm_ids:
+        try:
+            # a probe is the only way to learn the current latest message id in
+            # a chat; we delete it again right after.
+            probe = await context.bot.send_message(chat_id=cid, text="🧹")
+        except Exception:
+            continue                                # can't reach this DM
+        swept += 1
+        latest = probe.message_id
+        for mid in range(latest - 1, latest - 1 - count, -1):
+            if mid <= 0:
+                break
+            try:
+                await context.bot.delete_message(chat_id=cid, message_id=mid)
+                deleted += 1
+            except Exception:
+                pass                                # their message / gone / >48h
+        try:
+            await context.bot.delete_message(chat_id=cid, message_id=latest)
+        except Exception:
+            pass
+
+    await update.effective_message.reply_text(
+        f"🧹 Swept {swept} DM(s); deleted {deleted} recent bot message(s). "
+        "Group chats were left untouched.")
+
+
 @facil_only
 async def remind_command(update, context):
     body = _message_arg(update, context)
@@ -124,5 +194,6 @@ async def pinannounce_command(update, context):
 
 def register(app):
     app.add_handler(CommandHandler("announce", announce_command))
+    app.add_handler(CommandHandler("purge_dm_messages", purge_dm_messages_command))
     app.add_handler(CommandHandler("remind", remind_command))
     app.add_handler(CommandHandler("pinannounce", pinannounce_command))

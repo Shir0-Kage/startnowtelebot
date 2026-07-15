@@ -114,6 +114,65 @@ def test_announce_reports_when_no_groups(ann, store):
     assert "not in any groups" in upd.effective_message.reply_text.call_args[0][0].lower()
 
 
+def test_purge_dm_messages_deletes_latest_in_each_dm_only(ann, store):
+    store.ensure_group(-100, "AM Group")          # a real group — must be left alone
+    store.ensure_group(777, "Alice DM")           # individuals (positive ids)
+    store.ensure_group(888, "Bob DM")
+    upd = _update("/purge_dm_messages")
+    ctx = _ctx()
+    ctx.bot.send_message = AsyncMock(
+        side_effect=lambda **kw: SimpleNamespace(message_id=50))
+    ctx.bot.delete_message = AsyncMock()
+
+    asyncio.run(ann.purge_dm_messages_command(upd, ctx))
+
+    probed = {c.kwargs["chat_id"] for c in ctx.bot.send_message.call_args_list}
+    assert probed == {777, 888}                   # group -100 never probed
+    deleted = {(c.kwargs["chat_id"], c.kwargs["message_id"])
+               for c in ctx.bot.delete_message.call_args_list}
+    # per DM: the message before the probe (49) + the probe itself (50)
+    assert (777, 49) in deleted and (777, 50) in deleted
+    assert (888, 49) in deleted and (888, 50) in deleted
+    assert all(cid > 0 for cid, _ in deleted)     # never a group id
+
+
+def test_purge_dm_messages_respects_count(ann, store):
+    store.ensure_group(777, "Alice DM")
+    upd = _update("/purge_dm_messages 3")
+    ctx = _ctx()
+    ctx.bot.send_message = AsyncMock(
+        side_effect=lambda **kw: SimpleNamespace(message_id=50))
+    ctx.bot.delete_message = AsyncMock()
+
+    asyncio.run(ann.purge_dm_messages_command(upd, ctx))
+
+    ids = {c.kwargs["message_id"] for c in ctx.bot.delete_message.call_args_list}
+    assert {47, 48, 49, 50} <= ids                # 3 before the probe + the probe
+
+
+def test_purge_dm_messages_rejects_non_zzehao(ann, store):
+    store.ensure_group(777, "Alice DM")
+    upd = _update("/purge_dm_messages")
+    upd.effective_user = SimpleNamespace(id=2, username="aria", full_name="Aria")
+    ctx = _ctx()
+
+    asyncio.run(ann.purge_dm_messages_command(upd, ctx))
+
+    ctx.bot.send_message.assert_not_called()
+    assert "zzehao" in upd.effective_message.reply_text.call_args[0][0].lower()
+
+
+def test_purge_dm_messages_when_no_dms(ann, store):
+    store.ensure_group(-100, "AM Group")          # only a group on record
+    upd = _update("/purge_dm_messages")
+    ctx = _ctx()
+
+    asyncio.run(ann.purge_dm_messages_command(upd, ctx))
+
+    ctx.bot.send_message.assert_not_called()
+    assert "no individual" in upd.effective_message.reply_text.call_args[0][0].lower()
+
+
 def test_announce_counts_failed_deliveries(ann, store):
     store.ensure_group(-100, "AM Group")
     store.ensure_group(-200, "PM Group")
