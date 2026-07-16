@@ -30,6 +30,8 @@ HELP_TEXT = (
     "<b>🎉 Human Bingo</b>\n"
     "/get_bingo — get your Human Bingo card and start playing\n"
     "/submit_bingo — send your filled card to check for a win 🏆\n\n"
+    "<b>🎭 Charades</b>\n"
+    "/charades — get a word to act out (I'll DM it so no one else sees)\n\n"
     "/whistle &lt;message&gt; — (DM me) send an anonymous report to the organisers 🔔\n"
     "/undo_whistle — (DM me) take back your last anonymous report\n\n"
     "<b>For facilitators 🛠️</b>\n"

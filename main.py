@@ -18,6 +18,7 @@ from handlers import (
     announcements,
     attendance,
     bingo,
+    charades,
     common,
     provisioning,
     quests,
@@ -122,6 +123,7 @@ def main():
     # wire up each feature
     common.register(app)
     bingo.register(app)
+    charades.register(app)
     quests.register(app)
     schedule.register(app)
     settings.register(app)
