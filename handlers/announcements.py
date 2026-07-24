@@ -1,11 +1,14 @@
-"""Facilitator announcements: /announce (DM-only, broadcasts verbatim to every
-group), /edit_announce (edit messages by link), /remind, /pinannounce."""
+"""Facilitator announcements: /announce (DM-only, broadcasts verbatim — text
+and/or photo — to every group), /edit_announce (edit sent messages by link,
+text and/or photo), /remind, /pinannounce."""
 
 import html
 import logging
 import re
 
-from telegram.ext import CommandHandler
+from telegram import InputMediaPhoto
+from telegram.ext import (ApplicationHandlerStop, CommandHandler, MessageHandler,
+                          filters)
 
 import storage
 from utils.auth import facil_only
@@ -35,12 +38,19 @@ REMIND_HEADER = "⏰ <b>Quick Reminder</b>"
 
 
 def _message_arg(update, context):
-    """Everything after the command, as one string. None if empty."""
-    text = update.effective_message.text or ""
-    parts = text.split(maxsplit=1)
+    """Everything after the command word, as one string (reads a photo's caption
+    too). None if empty."""
+    msg = update.effective_message
+    raw = msg.text or msg.caption or ""
+    parts = raw.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         return None
     return parts[1].strip()
+
+
+def _photo_file_id(message):
+    """The largest attached photo's file_id, or None if the message has no photo."""
+    return message.photo[-1].file_id if message and message.photo else None
 
 
 async def _send_chunks(message, full_text):
@@ -55,8 +65,17 @@ async def _send_chunks(message, full_text):
 
 
 async def announce_command(update, context):
-    """@zzehao-only, DM-only. Send the message verbatim (word for word, no
-    header/footer) to every group the bot is in."""
+    """@zzehao-only, DM-only. Broadcast verbatim (text and/or a photo, no
+    header/footer) to every group. Attach a photo with the command in its caption
+    to include an image."""
+    await _announce(update, context)
+    # a photo command comes via the group=-1 MessageHandler; stop here so the
+    # bingo image handler (group 0) doesn't also treat the photo as a card.
+    if _photo_file_id(update.effective_message):
+        raise ApplicationHandlerStop
+
+
+async def _announce(update, context):
     user = update.effective_user
     handle = (user.username or "").lstrip("@").lower() if user else ""
     if handle != ANNOUNCER_HANDLE:
@@ -66,13 +85,15 @@ async def announce_command(update, context):
     chat = update.effective_chat
     if chat is not None and chat.type != "private":
         await update.effective_message.reply_text(
-            "DM me /announce <message> and I'll send it to every group.")
+            "DM me /announce <message> (optionally with a photo) and I'll send it "
+            "to every group.")
         return
 
+    photo = _photo_file_id(update.effective_message)
     body = _message_arg(update, context)
-    if not body:
+    if not body and not photo:
         await update.effective_message.reply_text(
-            "DM me the announcement to broadcast, e.g.\n"
+            "DM me the announcement to broadcast — text, a photo, or both, e.g.\n"
             "/announce Meet Up 1 is on tomorrow at 10am!"
         )
         return
@@ -86,8 +107,12 @@ async def announce_command(update, context):
     sent = failed = 0
     for g in groups:
         try:
-            # verbatim: plain text, no parse_mode, so it goes out exactly as typed
-            await context.bot.send_message(chat_id=g["chat_id"], text=body)
+            # verbatim: no parse_mode, so text/caption go out exactly as typed
+            if photo:
+                await context.bot.send_photo(
+                    chat_id=g["chat_id"], photo=photo, caption=body or None)
+            else:
+                await context.bot.send_message(chat_id=g["chat_id"], text=body)
             sent += 1
         except Exception:
             failed += 1                            # removed from that group, etc.
@@ -108,8 +133,16 @@ async def edit_announce_command(update, context):
         https://t.me/c/1802003400/54
         Updated announcement text (can span many lines)
 
-    Every listed message is set to the same new text. The bot can only edit its
-    OWN messages, and must still be in each chat."""
+    Attach a photo (command in the caption) to also swap the image — this only
+    works on messages the bot originally sent as a photo. Every listed message is
+    set to the same new text/photo; the bot can only edit its OWN messages and
+    must still be in each chat."""
+    await _edit_announce(update, context)
+    if _photo_file_id(update.effective_message):
+        raise ApplicationHandlerStop
+
+
+async def _edit_announce(update, context):
     user = update.effective_user
     handle = (user.username or "").lstrip("@").lower() if user else ""
     if handle != ANNOUNCER_HANDLE:
@@ -117,38 +150,47 @@ async def edit_announce_command(update, context):
             f"Only @{ANNOUNCER_HANDLE} can use /edit_announce.")
         return
 
-    text = update.effective_message.text or ""
-    matches = list(_MSG_LINK_RE.finditer(text))
+    message = update.effective_message
+    raw = message.text or message.caption or ""
+    matches = list(_MSG_LINK_RE.finditer(raw))
     if not matches:
         await update.effective_message.reply_text(
-            "Send message link(s) then the new text, e.g.\n"
+            "Send message link(s) then the new text (and/or a photo), e.g.\n"
             "/edit_announce https://t.me/c/123/45 <new text>")
         return
     # the new body is everything after the LAST link
-    new_text = text[matches[-1].end():].strip()
-    if not new_text:
+    new_text = raw[matches[-1].end():].strip()
+    photo = _photo_file_id(message)
+    if not new_text and not photo:
         await update.effective_message.reply_text(
-            "I see the link(s) but no new text — put the replacement message "
-            "after the last link.")
+            "I see the link(s) but no new text or photo — put the replacement "
+            "after the last link, or attach a photo.")
         return
 
     targets = [_parse_message_link(m) for m in matches]
     edited = failed = 0
     for chat_id, message_id in targets:
         try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=message_id, text=new_text)
+            if photo:
+                await context.bot.edit_message_media(
+                    chat_id=chat_id, message_id=message_id,
+                    media=InputMediaPhoto(media=photo, caption=new_text or None))
+            else:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=message_id, text=new_text)
             edited += 1
         except Exception as exc:
-            # not my message / unchanged text / not in chat / deleted
+            # not my message / unchanged / not in chat / deleted / text<->photo
             log.warning("couldn't edit message %s in %s: %s",
                         message_id, chat_id, exc)
             failed += 1
 
     summary = f"✏️ Edited {edited} message(s)."
     if failed:
-        summary += (f" Couldn't edit {failed} (must be my own message, still in "
-                    "the chat, and actually changed).")
+        why = (" (a photo edit only works on messages I first sent as a photo)"
+               if photo else
+               " (must be my own message, still in the chat, and actually changed)")
+        summary += f" Couldn't edit {failed}.{why}"
     await update.effective_message.reply_text(summary)
 
 
@@ -253,3 +295,13 @@ def register(app):
     app.add_handler(CommandHandler("purge_dm_messages", purge_dm_messages_command))
     app.add_handler(CommandHandler("remind", remind_command))
     app.add_handler(CommandHandler("pinannounce", pinannounce_command))
+    # A command sent as a PHOTO caption doesn't fire CommandHandler (text only),
+    # so route those explicitly. group=-1 runs ahead of bingo's private-photo
+    # handler in group 0; the handlers raise ApplicationHandlerStop so the photo
+    # isn't also processed as a bingo card.
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.CaptionRegex(r"(?i)^/announce\b"),
+        announce_command), group=-1)
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.CaptionRegex(r"(?i)^/edit_announce\b"),
+        edit_announce_command), group=-1)

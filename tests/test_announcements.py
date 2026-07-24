@@ -41,7 +41,18 @@ def _update(text, chat_type="private"):
     upd.effective_chat = SimpleNamespace(id=1, type=chat_type)
     msg = upd.effective_message
     msg.text = text
+    msg.caption = None
+    msg.photo = None            # a real message has [] / None, not a truthy mock
     msg.reply_text = AsyncMock()
+    return upd
+
+
+def _photo_update(caption, file_id="newpic", chat_type="private"):
+    """A photo message whose caption carries the command."""
+    upd = _update(None, chat_type)
+    msg = upd.effective_message
+    msg.caption = caption
+    msg.photo = [SimpleNamespace(file_id="small"), SimpleNamespace(file_id=file_id)]
     return upd
 
 
@@ -274,3 +285,67 @@ def test_edit_announce_counts_failures(ann):
     reply = upd.effective_message.reply_text.call_args[0][0].lower()
     assert "edited 1" in reply
     assert "couldn't edit 1" in reply
+
+
+# --- photo announcements & photo edits --------------------------------------
+
+def test_announce_with_photo_sends_photo_to_every_group(ann, store):
+    from telegram.ext import ApplicationHandlerStop
+    store.ensure_group(-100, "AM Group")
+    store.ensure_group(-200, "PM Group")
+    upd = _photo_update("/announce Look at this!", file_id="pic123")
+    ctx = _ctx()
+
+    with pytest.raises(ApplicationHandlerStop):     # stops the bingo photo handler
+        asyncio.run(ann.announce_command(upd, ctx))
+
+    ctx.bot.send_message.assert_not_called()        # photo path, not text
+    targets = {c.kwargs["chat_id"] for c in ctx.bot.send_photo.call_args_list}
+    assert targets == {-100, -200}
+    for c in ctx.bot.send_photo.call_args_list:
+        assert c.kwargs["photo"] == "pic123"        # largest photo's file_id
+        assert c.kwargs["caption"] == "Look at this!"
+
+
+def test_announce_photo_with_no_caption_text_still_sends(ann, store):
+    from telegram.ext import ApplicationHandlerStop
+    store.ensure_group(-100, "AM Group")
+    upd = _photo_update("/announce", file_id="pic123")   # photo, no extra text
+    ctx = _ctx()
+
+    with pytest.raises(ApplicationHandlerStop):
+        asyncio.run(ann.announce_command(upd, ctx))
+
+    ctx.bot.send_photo.assert_awaited_once()
+    assert ctx.bot.send_photo.call_args.kwargs["caption"] is None
+
+
+def test_edit_announce_with_photo_uses_edit_message_media(ann):
+    from telegram import InputMediaPhoto
+    from telegram.ext import ApplicationHandlerStop
+    upd = _photo_update(
+        "/edit_announce\nhttps://t.me/c/4292606016/29\nNew caption", file_id="pic999")
+    ctx = _ctx()
+
+    with pytest.raises(ApplicationHandlerStop):
+        asyncio.run(ann.edit_announce_command(upd, ctx))
+
+    ctx.bot.edit_message_text.assert_not_called()   # media path, not text
+    ctx.bot.edit_message_media.assert_awaited_once()
+    kw = ctx.bot.edit_message_media.call_args.kwargs
+    assert kw["chat_id"] == -1004292606016 and kw["message_id"] == 29
+    media = kw["media"]
+    assert isinstance(media, InputMediaPhoto)
+    assert media.media == "pic999"
+    assert media.caption == "New caption"
+
+
+def test_edit_announce_text_only_still_uses_edit_message_text(ann):
+    # no photo -> unchanged behaviour, and no ApplicationHandlerStop raised
+    upd = _update("/edit_announce https://t.me/c/4292606016/29 Just text")
+    ctx = _ctx()
+
+    asyncio.run(ann.edit_announce_command(upd, ctx))
+
+    ctx.bot.edit_message_media.assert_not_called()
+    ctx.bot.edit_message_text.assert_awaited_once()
