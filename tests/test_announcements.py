@@ -190,3 +190,87 @@ def test_announce_counts_failed_deliveries(ann, store):
     reply = upd.effective_message.reply_text.call_args[0][0]
     assert "1 group" in reply           # one delivered
     assert "couldn't reach 1" in reply.lower()
+
+
+# --- /edit_announce (edit messages by link) ---------------------------------
+
+def test_parse_private_thread_and_public_links(ann):
+    import re
+    pat = ann._MSG_LINK_RE
+    a = pat.search("https://t.me/c/4292606016/29")
+    assert ann._parse_message_link(a) == (-1004292606016, 29)
+    # forum-thread form: last number is the message id
+    b = pat.search("https://t.me/c/1802003400/12/54")
+    assert ann._parse_message_link(b) == (-1001802003400, 54)
+    # public username form
+    c = pat.search("https://t.me/startnowchannel/77")
+    assert ann._parse_message_link(c) == ("@startnowchannel", 77)
+
+
+def test_edit_announce_rewrites_each_linked_message(ann):
+    upd = _update("/edit_announce\n"
+                  "https://t.me/c/4292606016/29\n"
+                  "https://t.me/c/1802003400/54\n"
+                  "Updated text\nsecond line")
+    ctx = _ctx()
+
+    asyncio.run(ann.edit_announce_command(upd, ctx))
+
+    calls = ctx.bot.edit_message_text.call_args_list
+    targets = {(c.kwargs["chat_id"], c.kwargs["message_id"]) for c in calls}
+    assert targets == {(-1004292606016, 29), (-1001802003400, 54)}
+    for c in calls:
+        assert c.kwargs["text"] == "Updated text\nsecond line"   # multi-line body, verbatim
+        assert "parse_mode" not in c.kwargs
+    assert "edited 2" in upd.effective_message.reply_text.call_args[0][0].lower()
+
+
+def test_edit_announce_rejects_non_zzehao(ann):
+    upd = _update("/edit_announce https://t.me/c/1/2 hi")
+    upd.effective_user = SimpleNamespace(id=2, username="aria", full_name="Aria")
+    ctx = _ctx()
+
+    asyncio.run(ann.edit_announce_command(upd, ctx))
+
+    ctx.bot.edit_message_text.assert_not_called()
+    assert "zzehao" in upd.effective_message.reply_text.call_args[0][0].lower()
+
+
+def test_edit_announce_needs_a_link(ann):
+    upd = _update("/edit_announce just some text no link")
+    ctx = _ctx()
+
+    asyncio.run(ann.edit_announce_command(upd, ctx))
+
+    ctx.bot.edit_message_text.assert_not_called()
+    assert "link" in upd.effective_message.reply_text.call_args[0][0].lower()
+
+
+def test_edit_announce_needs_new_text_after_the_link(ann):
+    upd = _update("/edit_announce https://t.me/c/4292606016/29")
+    ctx = _ctx()
+
+    asyncio.run(ann.edit_announce_command(upd, ctx))
+
+    ctx.bot.edit_message_text.assert_not_called()
+    assert "no new text" in upd.effective_message.reply_text.call_args[0][0].lower()
+
+
+def test_edit_announce_counts_failures(ann):
+    upd = _update("/edit_announce\n"
+                  "https://t.me/c/4292606016/29\n"
+                  "https://t.me/c/1802003400/54\n"
+                  "New text")
+    ctx = _ctx()
+
+    def _edit(**kw):
+        if kw["message_id"] == 54:
+            raise RuntimeError("message can't be edited")
+        return SimpleNamespace(message_id=kw["message_id"])
+    ctx.bot.edit_message_text = AsyncMock(side_effect=_edit)
+
+    asyncio.run(ann.edit_announce_command(upd, ctx))
+
+    reply = upd.effective_message.reply_text.call_args[0][0].lower()
+    assert "edited 1" in reply
+    assert "couldn't edit 1" in reply

@@ -277,17 +277,6 @@ def all_groups():
     return [dict(r) for r in rows]
 
 
-def delete_dm_chats():
-    """Remove private-chat rows (positive chat ids) that /start and other commands
-    recorded in the groups table, keeping real group chats (negative ids). Returns
-    the number removed. Self-healing: a DM re-appears if that person messages the
-    bot again, so this only clears the current junk."""
-    with _lock:
-        cur = _conn.execute("DELETE FROM groups WHERE chat_id > 0")
-        _conn.commit()
-        return cur.rowcount
-
-
 def dm_chat_ids():
     """The individual DM chat ids recorded in the groups table (positive chat
     ids). These are exactly who a pre-fix /announce broadcast reached one-on-one,

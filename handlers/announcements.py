@@ -1,13 +1,30 @@
 """Facilitator announcements: /announce (DM-only, broadcasts verbatim to every
-group), /remind, /pinannounce (both posted in the current chat)."""
+group), /edit_announce (edit messages by link), /remind, /pinannounce."""
 
 import html
+import logging
+import re
 
 from telegram.ext import CommandHandler
 
 import storage
 from utils.auth import facil_only
 from utils.text import chunk_text
+
+log = logging.getLogger(__name__)
+
+# Telegram message links. Private groups/channels: t.me/c/<internal>/<msg> (or
+# .../<internal>/<thread>/<msg>); public: t.me/<username>/<msg>. We turn each into
+# a (chat_id, message_id) the Bot API can edit.
+_MSG_LINK_RE = re.compile(
+    r"t\.me/(?:c/(\d+)(?:/\d+)*/(\d+)|([A-Za-z]\w{3,})/(\d+))")
+
+
+def _parse_message_link(match):
+    """A regex match from _MSG_LINK_RE -> (chat_id, message_id)."""
+    if match.group(1):                              # private: -100 + internal id
+        return int("-100" + match.group(1)), int(match.group(2))
+    return "@" + match.group(3), int(match.group(4))  # public: @username
 
 # /announce broadcasts to every group, so it's locked to the lead organiser only.
 ANNOUNCER_HANDLE = "zzehao"
@@ -81,20 +98,58 @@ async def announce_command(update, context):
     await update.effective_message.reply_text(summary)
 
 
-async def purge_dm_chats_command(update, context):
-    """@zzehao-only: delete individual DM chats that got recorded as groups (via
-    /start etc.), keeping the real group chats. A one-off cleanup so group
-    broadcasts can never touch individuals."""
+async def edit_announce_command(update, context):
+    """@zzehao-only. Rewrite one or more already-sent messages by their links.
+    Format: paste the message link(s), then the new text after the last link —
+    e.g.
+
+        /edit_announce
+        https://t.me/c/4292606016/29
+        https://t.me/c/1802003400/54
+        Updated announcement text (can span many lines)
+
+    Every listed message is set to the same new text. The bot can only edit its
+    OWN messages, and must still be in each chat."""
     user = update.effective_user
     handle = (user.username or "").lstrip("@").lower() if user else ""
     if handle != ANNOUNCER_HANDLE:
         await update.effective_message.reply_text(
-            f"Only @{ANNOUNCER_HANDLE} can use /purge_dm_chats.")
+            f"Only @{ANNOUNCER_HANDLE} can use /edit_announce.")
         return
-    n = storage.delete_dm_chats()
-    await update.effective_message.reply_text(
-        f"🧹 Removed {n} individual DM chat(s) from the group list — real group "
-        "chats are untouched.")
+
+    text = update.effective_message.text or ""
+    matches = list(_MSG_LINK_RE.finditer(text))
+    if not matches:
+        await update.effective_message.reply_text(
+            "Send message link(s) then the new text, e.g.\n"
+            "/edit_announce https://t.me/c/123/45 <new text>")
+        return
+    # the new body is everything after the LAST link
+    new_text = text[matches[-1].end():].strip()
+    if not new_text:
+        await update.effective_message.reply_text(
+            "I see the link(s) but no new text — put the replacement message "
+            "after the last link.")
+        return
+
+    targets = [_parse_message_link(m) for m in matches]
+    edited = failed = 0
+    for chat_id, message_id in targets:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=new_text)
+            edited += 1
+        except Exception as exc:
+            # not my message / unchanged text / not in chat / deleted
+            log.warning("couldn't edit message %s in %s: %s",
+                        message_id, chat_id, exc)
+            failed += 1
+
+    summary = f"✏️ Edited {edited} message(s)."
+    if failed:
+        summary += (f" Couldn't edit {failed} (must be my own message, still in "
+                    "the chat, and actually changed).")
+    await update.effective_message.reply_text(summary)
 
 
 async def purge_dm_messages_command(update, context):
@@ -194,6 +249,7 @@ async def pinannounce_command(update, context):
 
 def register(app):
     app.add_handler(CommandHandler("announce", announce_command))
+    app.add_handler(CommandHandler("edit_announce", edit_announce_command))
     app.add_handler(CommandHandler("purge_dm_messages", purge_dm_messages_command))
     app.add_handler(CommandHandler("remind", remind_command))
     app.add_handler(CommandHandler("pinannounce", pinannounce_command))
