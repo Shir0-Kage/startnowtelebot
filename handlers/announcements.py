@@ -32,6 +32,16 @@ def _parse_message_link(match):
 # /announce broadcasts to every group, so it's locked to the lead organiser only.
 ANNOUNCER_HANDLE = "zzehao"
 
+# Commands that can arrive as a photo caption (matched against the caption).
+_ANNOUNCE_CMD_RE = re.compile(r"(?i)^/announce(@\w+)?(\s|$)")
+_EDIT_CMD_RE = re.compile(r"(?i)^/edit_announce(@\w+)?(\s|$)")
+
+# Photo albums arrive as several one-photo messages sharing a media_group_id,
+# with the caption on only the first. We buffer an /announce album's photos here,
+# keyed by media_group_id, then flush them as one media group after a short delay.
+_ALBUM_FLUSH_SECONDS = 2.0
+_pending_albums = {}   # media_group_id -> {"items": [file_id], "body": str|None, "chat_id": int}
+
 ANNOUNCE_HEADER = "📣 <b>Group Announcement</b>"
 ANNOUNCE_FOOTER = "Please check this chat for any updates. See y'all there ❤️"
 REMIND_HEADER = "⏰ <b>Quick Reminder</b>"
@@ -65,17 +75,10 @@ async def _send_chunks(message, full_text):
 
 
 async def announce_command(update, context):
-    """@zzehao-only, DM-only. Broadcast verbatim (text and/or a photo, no
-    header/footer) to every group. Attach a photo with the command in its caption
-    to include an image."""
-    await _announce(update, context)
-    # a photo command comes via the group=-1 MessageHandler; stop here so the
-    # bingo image handler (group 0) doesn't also treat the photo as a card.
-    if _photo_file_id(update.effective_message):
-        raise ApplicationHandlerStop
-
-
-async def _announce(update, context):
+    """@zzehao-only, DM-only. Broadcast verbatim (text and/or photo(s), no
+    header/footer) to every group. Attach a photo — or an album of photos — with
+    the command in the caption to include images. (Album handling lives in
+    _on_private_photo; this path covers text and a single photo.)"""
     user = update.effective_user
     handle = (user.username or "").lstrip("@").lower() if user else ""
     if handle != ANNOUNCER_HANDLE:
@@ -136,13 +139,8 @@ async def edit_announce_command(update, context):
     Attach a photo (command in the caption) to also swap the image — this only
     works on messages the bot originally sent as a photo. Every listed message is
     set to the same new text/photo; the bot can only edit its OWN messages and
-    must still be in each chat."""
-    await _edit_announce(update, context)
-    if _photo_file_id(update.effective_message):
-        raise ApplicationHandlerStop
-
-
-async def _edit_announce(update, context):
+    must still be in each chat. (One image per message — a message can't hold an
+    album, so extra photos are ignored here.)"""
     user = update.effective_user
     handle = (user.username or "").lstrip("@").lower() if user else ""
     if handle != ANNOUNCER_HANDLE:
@@ -192,6 +190,106 @@ async def _edit_announce(update, context):
                " (must be my own message, still in the chat, and actually changed)")
         summary += f" Couldn't edit {failed}.{why}"
     await update.effective_message.reply_text(summary)
+
+
+async def _on_private_photo(update, context):
+    """group=-1 router for private photos. A command in a photo caption doesn't
+    trigger CommandHandler, so we dispatch it here; we also collect the extra
+    photos of an /announce album. Anything that isn't ours falls through (no
+    ApplicationHandlerStop) so the bingo card handler in group 0 still runs."""
+    message = update.effective_message
+    caption = message.caption or ""
+    mgid = message.media_group_id
+    file_id = _photo_file_id(message)
+
+    # a later photo of an /announce album we're already collecting
+    if mgid is not None and mgid in _pending_albums:
+        if file_id:
+            _pending_albums[mgid]["items"].append(file_id)
+        raise ApplicationHandlerStop
+
+    if _ANNOUNCE_CMD_RE.match(caption):
+        if mgid is None:
+            await announce_command(update, context)      # single photo
+        else:
+            await _start_announce_album(update, context, mgid, file_id)
+        raise ApplicationHandlerStop
+
+    if _EDIT_CMD_RE.match(caption):
+        await edit_announce_command(update, context)     # single-image edit
+        raise ApplicationHandlerStop
+
+    return   # not an announce photo — let the bingo handler take it
+
+
+async def _start_announce_album(update, context, mgid, file_id):
+    """First photo of an /announce album: gate, buffer it, and schedule the flush
+    that broadcasts the whole album once the rest have arrived."""
+    user = update.effective_user
+    handle = (user.username or "").lstrip("@").lower() if user else ""
+    if handle != ANNOUNCER_HANDLE:
+        await update.effective_message.reply_text(
+            f"Only @{ANNOUNCER_HANDLE} can use /announce.")
+        return
+    chat = update.effective_chat
+    if chat is not None and chat.type != "private":
+        await update.effective_message.reply_text(
+            "DM me /announce <message> (optionally with photos) and I'll send it "
+            "to every group.")
+        return
+
+    _pending_albums[mgid] = {
+        "items": [file_id] if file_id else [],
+        "body": _message_arg(update, context),
+        "chat_id": chat.id,
+    }
+    jq = getattr(context, "job_queue", None)
+    if jq is not None:
+        jq.run_once(_flush_album, when=_ALBUM_FLUSH_SECONDS, data=mgid,
+                    name=f"announce_album:{mgid}")
+    else:
+        # no scheduler (shouldn't happen in prod) — flush what we have now
+        await _broadcast_album(context, _pending_albums.pop(mgid))
+
+
+async def _flush_album(context):
+    album = _pending_albums.pop(context.job.data, None)
+    if album:
+        await _broadcast_album(context, album)
+
+
+async def _broadcast_album(context, album):
+    """Send a collected /announce album to every group as one media group."""
+    items = album["items"][:10]          # Telegram albums hold at most 10
+    if not items:
+        return
+    groups = storage.all_groups()
+    if not groups:
+        await _reply_to(context, album["chat_id"],
+                        "I'm not in any groups yet, so there's nothing to announce to.")
+        return
+    body = album["body"]
+    # caption on the first item only (verbatim: no parse_mode)
+    media = [InputMediaPhoto(media=fid, caption=(body if i == 0 and body else None))
+             for i, fid in enumerate(items)]
+    sent = failed = 0
+    for g in groups:
+        try:
+            await context.bot.send_media_group(chat_id=g["chat_id"], media=media)
+            sent += 1
+        except Exception:
+            failed += 1
+    summary = f"📣 Announced ({len(items)} photos) to {sent} group(s)."
+    if failed:
+        summary += f" Couldn't reach {failed} (I may have been removed there)."
+    await _reply_to(context, album["chat_id"], summary)
+
+
+async def _reply_to(context, chat_id, text):
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        pass
 
 
 async def purge_dm_messages_command(update, context):
@@ -296,12 +394,9 @@ def register(app):
     app.add_handler(CommandHandler("remind", remind_command))
     app.add_handler(CommandHandler("pinannounce", pinannounce_command))
     # A command sent as a PHOTO caption doesn't fire CommandHandler (text only),
-    # so route those explicitly. group=-1 runs ahead of bingo's private-photo
-    # handler in group 0; the handlers raise ApplicationHandlerStop so the photo
-    # isn't also processed as a bingo card.
+    # and album photos after the first carry no caption at all — so route every
+    # private photo through _on_private_photo. It sits in group=-1 (ahead of
+    # bingo's private-photo handler in group 0) and only stops propagation for
+    # our announce/edit photos, so bingo cards still reach group 0.
     app.add_handler(MessageHandler(
-        filters.PHOTO & filters.CaptionRegex(r"(?i)^/announce\b"),
-        announce_command), group=-1)
-    app.add_handler(MessageHandler(
-        filters.PHOTO & filters.CaptionRegex(r"(?i)^/edit_announce\b"),
-        edit_announce_command), group=-1)
+        filters.ChatType.PRIVATE & filters.PHOTO, _on_private_photo), group=-1)

@@ -43,23 +43,36 @@ def _update(text, chat_type="private"):
     msg.text = text
     msg.caption = None
     msg.photo = None            # a real message has [] / None, not a truthy mock
+    msg.media_group_id = None
     msg.reply_text = AsyncMock()
     return upd
 
 
-def _photo_update(caption, file_id="newpic", chat_type="private"):
-    """A photo message whose caption carries the command."""
+def _photo_update(caption, file_id="newpic", chat_type="private", media_group_id=None):
+    """A photo message whose caption carries the command. Pass media_group_id to
+    simulate one item of an album."""
     upd = _update(None, chat_type)
     msg = upd.effective_message
     msg.caption = caption
     msg.photo = [SimpleNamespace(file_id="small"), SimpleNamespace(file_id=file_id)]
+    msg.media_group_id = media_group_id
     return upd
 
 
-def _ctx():
+def _ctx(with_job_queue=False):
     ctx = MagicMock()
     ctx.bot = AsyncMock()
+    ctx.job_queue = MagicMock() if with_job_queue else None
     return ctx
+
+
+@pytest.fixture(autouse=True)
+def _clear_albums():
+    """The pending-album buffer is a module global; clear it around each test."""
+    import handlers.announcements as ann
+    ann._pending_albums.clear()
+    yield
+    ann._pending_albums.clear()
 
 
 def test_announce_broadcasts_verbatim_to_every_group(ann, store):
@@ -287,9 +300,9 @@ def test_edit_announce_counts_failures(ann):
     assert "couldn't edit 1" in reply
 
 
-# --- photo announcements & photo edits --------------------------------------
+# --- single-photo announce/edit routed via _on_private_photo ----------------
 
-def test_announce_with_photo_sends_photo_to_every_group(ann, store):
+def test_private_photo_single_announce_sends_photo_to_every_group(ann, store):
     from telegram.ext import ApplicationHandlerStop
     store.ensure_group(-100, "AM Group")
     store.ensure_group(-200, "PM Group")
@@ -297,7 +310,7 @@ def test_announce_with_photo_sends_photo_to_every_group(ann, store):
     ctx = _ctx()
 
     with pytest.raises(ApplicationHandlerStop):     # stops the bingo photo handler
-        asyncio.run(ann.announce_command(upd, ctx))
+        asyncio.run(ann._on_private_photo(upd, ctx))
 
     ctx.bot.send_message.assert_not_called()        # photo path, not text
     targets = {c.kwargs["chat_id"] for c in ctx.bot.send_photo.call_args_list}
@@ -307,20 +320,7 @@ def test_announce_with_photo_sends_photo_to_every_group(ann, store):
         assert c.kwargs["caption"] == "Look at this!"
 
 
-def test_announce_photo_with_no_caption_text_still_sends(ann, store):
-    from telegram.ext import ApplicationHandlerStop
-    store.ensure_group(-100, "AM Group")
-    upd = _photo_update("/announce", file_id="pic123")   # photo, no extra text
-    ctx = _ctx()
-
-    with pytest.raises(ApplicationHandlerStop):
-        asyncio.run(ann.announce_command(upd, ctx))
-
-    ctx.bot.send_photo.assert_awaited_once()
-    assert ctx.bot.send_photo.call_args.kwargs["caption"] is None
-
-
-def test_edit_announce_with_photo_uses_edit_message_media(ann):
+def test_private_photo_edit_uses_edit_message_media(ann):
     from telegram import InputMediaPhoto
     from telegram.ext import ApplicationHandlerStop
     upd = _photo_update(
@@ -328,20 +328,28 @@ def test_edit_announce_with_photo_uses_edit_message_media(ann):
     ctx = _ctx()
 
     with pytest.raises(ApplicationHandlerStop):
-        asyncio.run(ann.edit_announce_command(upd, ctx))
+        asyncio.run(ann._on_private_photo(upd, ctx))
 
     ctx.bot.edit_message_text.assert_not_called()   # media path, not text
     ctx.bot.edit_message_media.assert_awaited_once()
-    kw = ctx.bot.edit_message_media.call_args.kwargs
-    assert kw["chat_id"] == -1004292606016 and kw["message_id"] == 29
-    media = kw["media"]
+    media = ctx.bot.edit_message_media.call_args.kwargs["media"]
     assert isinstance(media, InputMediaPhoto)
-    assert media.media == "pic999"
-    assert media.caption == "New caption"
+    assert media.media == "pic999" and media.caption == "New caption"
+
+
+def test_private_photo_non_command_falls_through_to_bingo(ann):
+    # a plain photo (a bingo card) must NOT be consumed here — no stop raised
+    upd = _photo_update(None, file_id="cardpic")    # no caption
+    ctx = _ctx()
+
+    asyncio.run(ann._on_private_photo(upd, ctx))     # returns, no ApplicationHandlerStop
+
+    ctx.bot.send_photo.assert_not_called()
+    ctx.bot.send_media_group.assert_not_called()
+    assert ann._pending_albums == {}                 # nothing buffered
 
 
 def test_edit_announce_text_only_still_uses_edit_message_text(ann):
-    # no photo -> unchanged behaviour, and no ApplicationHandlerStop raised
     upd = _update("/edit_announce https://t.me/c/4292606016/29 Just text")
     ctx = _ctx()
 
@@ -349,3 +357,53 @@ def test_edit_announce_text_only_still_uses_edit_message_text(ann):
 
     ctx.bot.edit_message_media.assert_not_called()
     ctx.bot.edit_message_text.assert_awaited_once()
+
+
+# --- multi-photo (album) announcements --------------------------------------
+
+def test_album_buffers_all_photos_then_broadcasts_as_one_group(ann, store):
+    from telegram.ext import ApplicationHandlerStop
+    store.ensure_group(-100, "AM Group")
+    store.ensure_group(-200, "PM Group")
+    ctx = _ctx(with_job_queue=True)
+
+    # first album item carries the command + caption
+    first = _photo_update("/announce Album time!", file_id="p1", media_group_id="G1")
+    with pytest.raises(ApplicationHandlerStop):
+        asyncio.run(ann._on_private_photo(first, ctx))
+    # the flush was scheduled, and the first photo is buffered
+    ctx.job_queue.run_once.assert_called_once()
+    assert ann._pending_albums["G1"]["items"] == ["p1"]
+
+    # two more items arrive with the same media_group_id and no caption
+    for fid in ("p2", "p3"):
+        cont = _photo_update(None, file_id=fid, media_group_id="G1")
+        with pytest.raises(ApplicationHandlerStop):
+            asyncio.run(ann._on_private_photo(cont, ctx))
+    assert ann._pending_albums["G1"]["items"] == ["p1", "p2", "p3"]
+
+    # the scheduled flush fires
+    job_ctx = _ctx()
+    job_ctx.job = SimpleNamespace(data="G1")
+    asyncio.run(ann._flush_album(job_ctx))
+
+    assert "G1" not in ann._pending_albums               # consumed
+    calls = job_ctx.bot.send_media_group.call_args_list
+    assert {c.kwargs["chat_id"] for c in calls} == {-100, -200}
+    media = calls[0].kwargs["media"]
+    assert [m.media for m in media] == ["p1", "p2", "p3"]   # ALL three photos
+    assert media[0].caption == "Album time!"                # caption on the first only
+    assert media[1].caption is None and media[2].caption is None
+
+
+def test_album_broadcast_caps_at_ten_photos(ann, store):
+    store.ensure_group(-100, "AM Group")
+    ann._pending_albums["G2"] = {
+        "items": [f"p{i}" for i in range(12)], "body": "big", "chat_id": 1}
+    job_ctx = _ctx()
+    job_ctx.job = SimpleNamespace(data="G2")
+
+    asyncio.run(ann._flush_album(job_ctx))
+
+    media = job_ctx.bot.send_media_group.call_args.kwargs["media"]
+    assert len(media) == 10                                 # Telegram album limit
